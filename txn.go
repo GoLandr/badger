@@ -269,6 +269,9 @@ func (pi *pendingWritesIterator) Close() error {
 	return nil
 }
 
+func (pi *pendingWritesIterator) TableName() string {
+	return ""
+}
 func (txn *Txn) newPendingWritesIterator(reversed bool) *pendingWritesIterator {
 	if !txn.update || len(txn.pendingWrites) == 0 {
 		return nil

@@ -477,6 +477,10 @@ func (s *Skiplist) NewUniIterator(reversed bool) *UniIterator {
 	}
 }
 
+func (s *UniIterator) TableName() string {
+	return ""
+}
+
 // Next implements y.Interface
 func (s *UniIterator) Next() {
 	if !s.reversed {

@@ -169,6 +169,11 @@ func (t *Table) NewIterator(reversed bool) *Iterator {
 	return ti
 }
 
+// TableName closes the iterator (and it must be called).
+func (itr *Iterator) TableName() string {
+	return itr.t.Filename()
+}
+
 // Close closes the iterator (and it must be called).
 func (itr *Iterator) Close() error {
 	return itr.t.DecrRef()
@@ -417,6 +422,9 @@ func NewConcatIterator(tbls []*Table, reversed bool) *ConcatIterator {
 	}
 }
 
+func (s *ConcatIterator) TableName() string {
+	return ""
+}
 func (s *ConcatIterator) setIdx(idx int) {
 	s.idx = idx
 	if idx < 0 || idx >= len(s.iters) {

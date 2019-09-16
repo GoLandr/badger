@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"container/heap"
 	"encoding/binary"
+	"fmt"
 
 	"github.com/pkg/errors"
 )
@@ -94,6 +95,7 @@ type Iterator interface {
 	Key() []byte
 	Value() ValueStruct
 	Valid() bool
+	TableName() string
 
 	// All iterators should be closed so that file garbage collection works.
 	Close() error
@@ -164,6 +166,7 @@ func (s *MergeIterator) initHeap() {
 		if !itr.Valid() {
 			continue
 		}
+		fmt.Println("t", itr.TableName(), "nice", idx)
 		e := &elem{itr: itr, nice: idx, reversed: s.reversed}
 		s.h = append(s.h, e)
 	}
