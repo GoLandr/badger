@@ -542,7 +542,7 @@ func TestMergingIteratorReversed(t *testing.T) {
 	require.NoError(t, err)
 	defer tbl2.DecrRef()
 	it1 := tbl1.NewIterator(true)
-	it2 := NewConcatIterator([]*Table{tbl2}, true)
+	it2 := tbl2.NewIterator(true)
 	it := y.NewMergeIterator([]y.Iterator{it1, it2}, true)
 	defer it.Close()
 
