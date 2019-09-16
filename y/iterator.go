@@ -21,6 +21,7 @@ import (
 	"container/heap"
 	"encoding/binary"
 
+	"github.com/davecgh/go-spew/spew"
 	"github.com/pkg/errors"
 )
 
@@ -142,6 +143,7 @@ type MergeIterator struct {
 
 // NewMergeIterator returns a new MergeIterator from a list of Iterators.
 func NewMergeIterator(iters []Iterator, reversed bool) *MergeIterator {
+	spew.Dump(iters)
 	m := &MergeIterator{all: iters, reversed: reversed}
 	m.h = make(elemHeap, 0, len(iters))
 	m.initHeap()
