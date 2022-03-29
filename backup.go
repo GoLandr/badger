@@ -23,46 +23,66 @@ import (
 	"encoding/binary"
 	"io"
 
-	"github.com/dgraph-io/badger/pb"
-	"github.com/dgraph-io/badger/y"
+	"github.com/dgraph-io/badger/v3/pb"
+	"github.com/dgraph-io/badger/v3/y"
+	"github.com/dgraph-io/ristretto/z"
 	"github.com/golang/protobuf/proto"
+	"github.com/pkg/errors"
 )
 
-// Backup is a wrapper function over Stream.Backup to generate full and incremental backups of the
-// DB. For more control over how many goroutines are used to generate the backup, or if you wish to
-// backup only a certain range of keys, use Stream.Backup directly.
+// flushThreshold determines when a buffer will be flushed. When performing a
+// backup/restore, the entries will be batched up until the total size of batch
+// is more than flushThreshold or entry size (without the value size) is more
+// than the maxBatchSize.
+const flushThreshold = 100 << 20
+
+// Backup dumps a protobuf-encoded list of all entries in the database into the
+// given writer, that are newer than or equal to the specified version. It
+// returns a timestamp (version) indicating the version of last entry that is
+// dumped, which after incrementing by 1 can be passed into later invocation to
+// generate incremental backup of entries that have been added/modified since
+// the last invocation of DB.Backup().
+// DB.Backup is a wrapper function over Stream.Backup to generate full and
+// incremental backups of the DB. For more control over how many goroutines are
+// used to generate the backup, or if you wish to backup only a certain range
+// of keys, use Stream.Backup directly.
 func (db *DB) Backup(w io.Writer, since uint64) (uint64, error) {
 	stream := db.NewStream()
 	stream.LogPrefix = "DB.Backup"
+	stream.SinceTs = since
 	return stream.Backup(w, since)
 }
 
 // Backup dumps a protobuf-encoded list of all entries in the database into the
-// given writer, that are newer than the specified version. It returns a
-// timestamp indicating when the entries were dumped which can be passed into a
-// later invocation to generate an incremental dump, of entries that have been
-// added/modified since the last invocation of Stream.Backup().
+// given writer, that are newer than or equal to the specified version. It returns a
+// timestamp(version) indicating the version of last entry that was dumped, which
+// after incrementing by 1 can be passed into a later invocation to generate an
+// incremental dump of entries that have been added/modified since the last
+// invocation of Stream.Backup().
 //
 // This can be used to backup the data in a database at a given point in time.
 func (stream *Stream) Backup(w io.Writer, since uint64) (uint64, error) {
 	stream.KeyToList = func(key []byte, itr *Iterator) (*pb.KVList, error) {
 		list := &pb.KVList{}
+		a := itr.Alloc
 		for ; itr.Valid(); itr.Next() {
 			item := itr.Item()
 			if !bytes.Equal(item.Key(), key) {
 				return list, nil
 			}
 			if item.Version() < since {
-				// Ignore versions less than given timestamp, or skip older
-				// versions of the given key.
-				return list, nil
+				return nil, errors.Errorf("Backup: Item Version: %d less than sinceTs: %d",
+					item.Version(), since)
 			}
 
 			var valCopy []byte
 			if !item.IsDeletedOrExpired() {
 				// No need to copy value, if item is deleted or expired.
 				var err error
-				valCopy, err = item.ValueCopy(nil)
+				err = item.Value(func(val []byte) error {
+					valCopy = a.Copy(val)
+					return nil
+				})
 				if err != nil {
 					stream.db.opt.Errorf("Key [%x, %d]. Error while fetching value [%v]\n",
 						item.Key(), item.Version(), err)
@@ -72,13 +92,14 @@ func (stream *Stream) Backup(w io.Writer, since uint64) (uint64, error) {
 
 			// clear txn bits
 			meta := item.meta &^ (bitTxn | bitFinTxn)
-			kv := &pb.KV{
-				Key:       item.KeyCopy(nil),
+			kv := y.NewKV(a)
+			*kv = pb.KV{
+				Key:       a.Copy(item.Key()),
 				Value:     valCopy,
-				UserMeta:  []byte{item.UserMeta()},
+				UserMeta:  a.Copy([]byte{item.UserMeta()}),
 				Version:   item.Version(),
 				ExpiresAt: item.ExpiresAt(),
-				Meta:      []byte{meta},
+				Meta:      a.Copy([]byte{meta}),
 			}
 			list.Kv = append(list.Kv, kv)
 
@@ -101,12 +122,22 @@ func (stream *Stream) Backup(w io.Writer, since uint64) (uint64, error) {
 	}
 
 	var maxVersion uint64
-	stream.Send = func(list *pb.KVList) error {
+	stream.Send = func(buf *z.Buffer) error {
+		list, err := BufferToKVList(buf)
+		if err != nil {
+			return err
+		}
+		out := list.Kv[:0]
 		for _, kv := range list.Kv {
 			if maxVersion < kv.Version {
 				maxVersion = kv.Version
 			}
+			if !kv.StreamDone {
+				// Don't pick stream done changes.
+				out = append(out, kv)
+			}
 		}
+		list.Kv = out
 		return writeTo(list, w)
 	}
 
@@ -134,6 +165,7 @@ type KVLoader struct {
 	throttle    *y.Throttle
 	entries     []*Entry
 	entriesSize int64
+	totalSize   int64
 }
 
 // NewKVLoader returns a new instance of KVLoader.
@@ -161,16 +193,18 @@ func (l *KVLoader) Set(kv *pb.KV) error {
 		ExpiresAt: kv.ExpiresAt,
 		meta:      meta,
 	}
-	estimatedSize := int64(e.estimateSize(l.db.opt.ValueThreshold))
+	estimatedSize := e.estimateSizeAndSetThreshold(l.db.valueThreshold())
 	// Flush entries if inserting the next entry would overflow the transactional limits.
 	if int64(len(l.entries))+1 >= l.db.opt.maxBatchCount ||
-		l.entriesSize+estimatedSize >= l.db.opt.maxBatchSize {
+		l.entriesSize+estimatedSize >= l.db.opt.maxBatchSize ||
+		l.totalSize >= flushThreshold {
 		if err := l.send(); err != nil {
 			return err
 		}
 	}
 	l.entries = append(l.entries, e)
 	l.entriesSize += estimatedSize
+	l.totalSize += estimatedSize + int64(len(e.Value))
 	return nil
 }
 
@@ -186,6 +220,7 @@ func (l *KVLoader) send() error {
 
 	l.entries = make([]*Entry, 0, l.db.opt.maxBatchCount)
 	l.entriesSize = 0
+	l.totalSize = 0
 	return nil
 }
 

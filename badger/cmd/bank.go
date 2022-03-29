@@ -30,10 +30,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/dgraph-io/badger"
-	"github.com/dgraph-io/badger/options"
-	"github.com/dgraph-io/badger/pb"
-	"github.com/dgraph-io/badger/y"
+	"github.com/dgraph-io/badger/v3"
+	"github.com/dgraph-io/badger/v3/pb"
+	"github.com/dgraph-io/badger/v3/y"
+	"github.com/dgraph-io/ristretto/z"
 	"github.com/spf13/cobra"
 )
 
@@ -63,17 +63,22 @@ failure of the total invariant.
 	RunE: runDisect,
 }
 
-var numGoroutines, numAccounts, numPrevious int
-var duration string
-var stopAll int32
-var mmap bool
-var checkStream bool
-var checkSubscriber bool
-var verbose bool
+var (
+	numGoroutines   int
+	numAccounts     int
+	numPrevious     int
+	duration        string
+	stopAll         int32
+	checkStream     bool
+	checkSubscriber bool
+	verbose         bool
+	encryptionKey   string
+)
 
-const keyPrefix = "account:"
-
-const initialBal uint64 = 100
+const (
+	keyPrefix         = "account:"
+	initialBal uint64 = 100
+)
 
 func init() {
 	RootCmd.AddCommand(testCmd)
@@ -85,7 +90,6 @@ func init() {
 	bankTest.Flags().IntVarP(
 		&numGoroutines, "conc", "c", 16, "Number of concurrent transactions to run.")
 	bankTest.Flags().StringVarP(&duration, "duration", "d", "3m", "How long to run the test.")
-	bankTest.Flags().BoolVarP(&mmap, "mmap", "m", false, "If true, mmap LSM tree. Default is RAM.")
 	bankTest.Flags().BoolVarP(&checkStream, "check_stream", "s", false,
 		"If true, the test will send transactions to another badger instance via the stream "+
 			"interface in order to verify that all data is streamed correctly.")
@@ -95,9 +99,13 @@ func init() {
 	bankTest.Flags().BoolVarP(&verbose, "verbose", "v", false,
 		"If true, the test will print all the executed bank transfers to standard output. "+
 			"This outputs a lot so it's best to turn it off when running the test for a while.")
+	bankTest.Flags().StringVarP(&encryptionKey, "encryption-key", "e", "",
+		"If it is true, badger will encrypt all the data stored on the disk.")
 
 	bankDisect.Flags().IntVarP(&numPrevious, "previous", "p", 12,
 		"Starting from the violation txn, how many previous versions to retrieve.")
+	bankDisect.Flags().StringVar(&encryptionKey, "decryption-key", "",
+		"If set, DB will be opened using the provided decryption key.")
 }
 
 func key(account int) []byte {
@@ -115,7 +123,7 @@ func toSlice(bal uint64) []byte {
 }
 
 func getBalance(txn *badger.Txn, account int) (uint64, error) {
-	item, err := txn.Get(key(account))
+	item, err := get(txn, key(account))
 	if err != nil {
 		return 0, err
 	}
@@ -187,6 +195,25 @@ func diff(a, b []account) string {
 
 var errFailure = errors.New("test failed due to balance mismatch")
 
+// get function will fetch the value for the key "k" either by using the
+// txn.Get API or the iterator.Seek API.
+func get(txn *badger.Txn, k []byte) (*badger.Item, error) {
+	if rand.Int()%2 == 0 {
+		return txn.Get(k)
+	}
+
+	iopt := badger.DefaultIteratorOptions
+	// PrefectValues is expensive. We don't need it here.
+	iopt.PrefetchValues = false
+	it := txn.NewIterator(iopt)
+	defer it.Close()
+	it.Seek(k)
+	if it.Valid() {
+		return it.Item(), nil
+	}
+	return nil, badger.ErrKeyNotFound
+}
+
 // seekTotal retrives the total of all accounts by seeking for each account key.
 func seekTotal(txn *badger.Txn) ([]account, error) {
 	expected := uint64(numAccounts) * uint64(initialBal)
@@ -194,7 +221,7 @@ func seekTotal(txn *badger.Txn) ([]account, error) {
 
 	var total uint64
 	for i := 0; i < numAccounts; i++ {
-		item, err := txn.Get(key(i))
+		item, err := get(txn, key(i))
 		if err != nil {
 			log.Printf("Error for account: %d. err=%v. key=%q\n", i, err, key(i))
 			return accounts, err
@@ -282,7 +309,9 @@ func runDisect(cmd *cobra.Command, args []string) error {
 	// transction which caused the total mismatch.
 	db, err := badger.OpenManaged(badger.DefaultOptions(sstDir).
 		WithValueDir(vlogDir).
-		WithReadOnly(true))
+		WithReadOnly(true).
+		WithEncryptionKey([]byte(encryptionKey)).
+		WithIndexCacheSize(1 << 30))
 	if err != nil {
 		return err
 	}
@@ -327,17 +356,22 @@ func runTest(cmd *cobra.Command, args []string) error {
 	// Open DB
 	opts := badger.DefaultOptions(sstDir).
 		WithValueDir(vlogDir).
-		WithMaxTableSize(4 << 20). // Force more compactions.
-		WithNumLevelZeroTables(2).
-		WithNumMemtables(2).
-		// Do not GC any versions, because we need them for the disect..
+		// Do not GC any versions, because we need them for the disect.
 		WithNumVersionsToKeep(int(math.MaxInt32)).
-		WithValueThreshold(1) // Make all values go to value log
-	if mmap {
-		opts = opts.WithTableLoadingMode(options.MemoryMap)
+		WithBlockCacheSize(1 << 30).
+		WithIndexCacheSize(1 << 30)
+
+	if verbose {
+		opts = opts.WithLoggingLevel(badger.DEBUG)
+	}
+
+	if encryptionKey != "" {
+		opts = opts.WithEncryptionKey([]byte(encryptionKey))
+		// The following comment is intentional as we would need the encryption key in case
+		// we want to run disect tool on the directory generated by bank test tool.
+		log.Printf("Using encryption key %s\n", encryptionKey)
 	}
 	log.Printf("Opening DB with options: %+v\n", opts)
-
 	db, err := badger.Open(opts)
 	if err != nil {
 		return err
@@ -465,13 +499,15 @@ func runTest(cmd *cobra.Command, args []string) error {
 				batch := tmpDb.NewWriteBatch()
 
 				stream := db.NewStream()
-				stream.Send = func(list *pb.KVList) error {
-					for _, kv := range list.Kv {
-						if err := batch.Set(kv.Key, kv.Value); err != nil {
+				stream.Send = func(buf *z.Buffer) error {
+					err := buf.SliceIterate(func(s []byte) error {
+						var kv pb.KV
+						if err := kv.Unmarshal(s); err != nil {
 							return err
 						}
-					}
-					return nil
+						return batch.Set(kv.Key, kv.Value)
+					})
+					return err
 				}
 				y.Check(stream.Orchestrate(context.Background()))
 				y.Check(batch.Flush())
@@ -523,19 +559,19 @@ func runTest(cmd *cobra.Command, args []string) error {
 		subWg.Add(1)
 		go func() {
 			defer subWg.Done()
-			accountIDS := [][]byte{}
+			accountIDS := []pb.Match{}
 			for i := 0; i < numAccounts; i++ {
-				accountIDS = append(accountIDS, key(i))
+				accountIDS = append(accountIDS, pb.Match{Prefix: key(i), IgnoreBytes: ""})
 			}
-			updater := func(kvs *pb.KVList) {
+			updater := func(kvs *pb.KVList) error {
 				batch := subscribeDB.NewWriteBatch()
 				for _, kv := range kvs.GetKv() {
 					y.Check(batch.Set(kv.Key, kv.Value))
 				}
 
-				y.Check(batch.Flush())
+				return batch.Flush()
 			}
-			_ = db.Subscribe(ctx, updater, accountIDS...)
+			_ = db.Subscribe(ctx, updater, accountIDS)
 		}()
 	}
 

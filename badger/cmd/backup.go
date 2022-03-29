@@ -18,15 +18,17 @@ package cmd
 
 import (
 	"bufio"
+	"math"
 	"os"
 
-	"github.com/dgraph-io/badger"
-	"github.com/dgraph-io/badger/y"
+	"github.com/dgraph-io/badger/v3"
 	"github.com/spf13/cobra"
 )
 
-var backupFile string
-var truncate bool
+var bo = struct {
+	backupFile  string
+	numVersions int
+}{}
 
 // backupCmd represents the backup command
 var backupCmd = &cobra.Command{
@@ -43,24 +45,30 @@ database.`,
 
 func init() {
 	RootCmd.AddCommand(backupCmd)
-	backupCmd.Flags().StringVarP(&backupFile, "backup-file", "f",
+	backupCmd.Flags().StringVarP(&bo.backupFile, "backup-file", "f",
 		"badger.bak", "File to backup to")
-	backupCmd.Flags().BoolVarP(&truncate, "truncate", "t",
-		false, "Allow value log truncation if required.")
+	backupCmd.Flags().IntVarP(&bo.numVersions, "num-versions", "n",
+		0, "Number of versions to keep. A value <= 0 means keep all versions.")
 }
 
 func doBackup(cmd *cobra.Command, args []string) error {
-	// Open DB
-	db, err := badger.Open(badger.DefaultOptions(sstDir).
+	opt := badger.DefaultOptions(sstDir).
 		WithValueDir(vlogDir).
-		WithTruncate(truncate))
+		WithNumVersionsToKeep(math.MaxInt32)
+
+	if bo.numVersions > 0 {
+		opt.NumVersionsToKeep = bo.numVersions
+	}
+
+	// Open DB
+	db, err := badger.Open(opt)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
 	// Create File
-	f, err := os.Create(backupFile)
+	f, err := os.Create(bo.backupFile)
 	if err != nil {
 		return err
 	}
@@ -74,7 +82,7 @@ func doBackup(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if err = y.FileSync(f); err != nil {
+	if err = f.Sync(); err != nil {
 		return err
 	}
 

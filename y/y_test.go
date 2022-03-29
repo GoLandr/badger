@@ -2,12 +2,15 @@ package y
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"math/rand"
 	"testing"
 	"time"
 
+	"github.com/dgraph-io/badger/v3/pb"
+	"github.com/dgraph-io/ristretto/z"
 	"github.com/stretchr/testify/require"
 )
 
@@ -176,7 +179,7 @@ func TestPagebufferReader2(t *testing.T) {
 	require.Equal(t, n, 10, "length of buffer and length written should be equal")
 	require.NoError(t, err, "unable to write bytes to buffer")
 
-	randOffset := int(rand.Int31n(int32(b.length)))
+	randOffset := int(rand.Int31n(int32(b.length) - 1))
 	randLength := int(rand.Int31n(int32(b.length - randOffset)))
 	reader := b.NewReaderAt(randOffset)
 	// Read randLength bytes.
@@ -222,10 +225,12 @@ func TestPagebufferReader3(t *testing.T) {
 	// Read EOF.
 	n, err = reader.Read(readBuf)
 	require.Equal(t, err, io.EOF, "should return EOF")
+	require.Equal(t, n, 0)
 
 	// Read EOF again.
 	n, err = reader.Read(readBuf)
 	require.Equal(t, err, io.EOF, "should return EOF")
+	require.Equal(t, n, 0)
 }
 
 // Test when read buffer is larger than PageBuffer.
@@ -250,4 +255,52 @@ func TestPagebufferReader4(t *testing.T) {
 	// Read EOF.
 	n, err = reader.Read(readBuf)
 	require.Equal(t, err, io.EOF, "should return EOF")
+	require.Equal(t, n, 0)
+}
+
+func TestSizeVarintForZero(t *testing.T) {
+	siz := sizeVarint(0)
+	require.Equal(t, 1, siz)
+}
+
+func TestEncodedSize(t *testing.T) {
+	valBufSize := uint32(rand.Int31n(1e5))
+	expiry := rand.Uint64()
+	expiryVarintBuf := make([]byte, 64)
+	expVarintSize := uint32(binary.PutUvarint(expiryVarintBuf, expiry))
+	valBuf := make([]byte, valBufSize)
+	_, _ = rand.Read(valBuf)
+
+	valStruct := &ValueStruct{
+		Value:     valBuf,
+		ExpiresAt: expiry,
+	}
+
+	require.Equal(t, valBufSize+uint32(2)+expVarintSize, valStruct.EncodedSize())
+}
+
+func TestAllocatorReuse(t *testing.T) {
+	a := z.NewAllocator(1024, "test")
+	defer a.Release()
+
+	N := 1024
+	buf := make([]byte, 4096)
+	rand.Read(buf)
+
+	for i := 0; i < N; i++ {
+		a.Reset()
+		var list pb.KVList
+		for j := 0; j < N; j++ {
+			kv := NewKV(a)
+			sz := rand.Intn(1024)
+			kv.Key = a.Copy(buf[:sz])
+			kv.Value = a.Copy(buf[:4*sz])
+			kv.Meta = a.Copy([]byte{1})
+			kv.Version = uint64(sz)
+			list.Kv = append(list.Kv, kv)
+		}
+		_, err := list.Marshal()
+		require.NoError(t, err)
+	}
+	t.Logf("Allocator: %s\n", a)
 }

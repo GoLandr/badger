@@ -12,9 +12,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/dgraph-io/badger"
-	"github.com/dgraph-io/badger/options"
-	"github.com/dgraph-io/badger/y"
+	"github.com/dgraph-io/badger/v3"
+	"github.com/dgraph-io/badger/v3/y"
+	"github.com/dgraph-io/ristretto/z"
 )
 
 var maxValue int64 = 10000000
@@ -103,8 +103,6 @@ func main() {
 	os.RemoveAll(dir)
 
 	db, err := badger.Open(badger.DefaultOptions(dir).
-		WithTableLoadingMode(options.MemoryMap).
-		WithValueLogLoadingMode(options.FileIO).
 		WithSyncWrites(false))
 	if err != nil {
 		log.Fatal(err)
@@ -115,7 +113,7 @@ func main() {
 		_ = http.ListenAndServe("localhost:8080", nil)
 	}()
 
-	closer := y.NewCloser(11)
+	closer := z.NewCloser(11)
 	go func() {
 		// Run value log GC.
 		defer closer.Done()

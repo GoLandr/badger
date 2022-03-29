@@ -29,23 +29,29 @@ import (
 
 	"github.com/pkg/errors"
 
-	"github.com/dgraph-io/badger"
-	"github.com/dgraph-io/badger/options"
-	"github.com/dgraph-io/badger/table"
-	"github.com/dgraph-io/badger/y"
+	"github.com/dgraph-io/badger/v3"
+	"github.com/dgraph-io/badger/v3/options"
+	"github.com/dgraph-io/badger/v3/table"
+	"github.com/dgraph-io/badger/v3/y"
 	humanize "github.com/dustin/go-humanize"
 	"github.com/spf13/cobra"
 )
 
 type flagOptions struct {
-	showTables    bool
-	showHistogram bool
-	showKeys      bool
-	withPrefix    string
-	keyLookup     string
-	itemMeta      bool
-	keyHistory    bool
-	showInternal  bool
+	showTables               bool
+	showHistogram            bool
+	showKeys                 bool
+	withPrefix               string
+	keyLookup                string
+	itemMeta                 bool
+	keyHistory               bool
+	showInternal             bool
+	readOnly                 bool
+	truncate                 bool
+	encryptionKey            string
+	checksumVerificationMode string
+	discard                  bool
+	externalMagicVersion     uint16
 }
 
 var (
@@ -67,6 +73,18 @@ func init() {
 	infoCmd.Flags().BoolVar(
 		&opt.showInternal, "show-internal", false, "Show internal keys along with other keys."+
 			" This option should be used along with --show-key option")
+	infoCmd.Flags().BoolVar(&opt.readOnly, "read-only", true, "If set to true, DB will be opened "+
+		"in read only mode. If DB has not been closed properly, this option can be set to false "+
+		"to open DB.")
+	infoCmd.Flags().BoolVar(&opt.truncate, "truncate", false, "If set to true, it allows "+
+		"truncation of value log files if they have corrupt data.")
+	infoCmd.Flags().StringVar(&opt.encryptionKey, "enc-key", "", "Use the provided encryption key")
+	infoCmd.Flags().StringVar(&opt.checksumVerificationMode, "cv-mode", "none",
+		"[none, table, block, tableAndBlock] Specifies when the db should verify checksum for SST.")
+	infoCmd.Flags().BoolVar(&opt.discard, "discard", false,
+		"Parse and print DISCARD file from value logs.")
+	infoCmd.Flags().Uint16Var(&opt.externalMagicVersion, "external-magic", 0,
+		"External magic number")
 }
 
 var infoCmd = &cobra.Command{
@@ -82,17 +100,35 @@ to the Dgraph team.
 }
 
 func handleInfo(cmd *cobra.Command, args []string) error {
+	cvMode := checksumVerificationMode(opt.checksumVerificationMode)
+	bopt := badger.DefaultOptions(sstDir).
+		WithValueDir(vlogDir).
+		WithReadOnly(opt.readOnly).
+		WithBlockCacheSize(100 << 20).
+		WithIndexCacheSize(200 << 20).
+		WithEncryptionKey([]byte(opt.encryptionKey)).
+		WithChecksumVerificationMode(cvMode).
+		WithExternalMagic(opt.externalMagicVersion)
+
+	if opt.discard {
+		ds, err := badger.InitDiscardStats(bopt)
+		y.Check(err)
+		ds.Iterate(func(fid, stats uint64) {
+			fmt.Printf("Value Log Fid: %5d. Stats: %10d [ %s ]\n",
+				fid, stats, humanize.IBytes(stats))
+		})
+		fmt.Println("DONE")
+		return nil
+	}
+
 	if err := printInfo(sstDir, vlogDir); err != nil {
-		return errors.Wrap(err, "failed to print information in MANIFEST file")
+		return y.Wrap(err, "failed to print information in MANIFEST file")
 	}
 
 	// Open DB
-	db, err := badger.Open(badger.DefaultOptions(sstDir).
-		WithValueDir(vlogDir).
-		WithReadOnly(true).
-		WithTableLoadingMode(options.MemoryMap))
+	db, err := badger.Open(bopt)
 	if err != nil {
-		return errors.Wrap(err, "failed to open database")
+		return y.Wrap(err, "failed to open database")
 	}
 	defer db.Close()
 
@@ -102,7 +138,7 @@ func handleInfo(cmd *cobra.Command, args []string) error {
 
 	prefix, err := hex.DecodeString(opt.withPrefix)
 	if err != nil {
-		return errors.Wrapf(err, "failed to decode hex prefix: %s", opt.withPrefix)
+		return y.Wrapf(err, "failed to decode hex prefix: %s", opt.withPrefix)
 	}
 	if opt.showHistogram {
 		db.PrintHistogram(prefix)
@@ -116,7 +152,7 @@ func handleInfo(cmd *cobra.Command, args []string) error {
 
 	if len(opt.keyLookup) > 0 {
 		if err := lookup(db); err != nil {
-			return errors.Wrapf(err, "failed to perform lookup for the key: %x", opt.keyLookup)
+			return y.Wrapf(err, "failed to perform lookup for the key: %x", opt.keyLookup)
 		}
 	}
 	return nil
@@ -141,7 +177,7 @@ func showKeys(db *badger.DB, prefix []byte) error {
 	for it.Rewind(); it.Valid(); it.Next() {
 		item := it.Item()
 		if err := printKey(item, false); err != nil {
-			return errors.Wrapf(err, "failed to print information about key: %x(%d)",
+			return y.Wrapf(err, "failed to print information about key: %x(%d)",
 				item.Key(), item.Version())
 		}
 		totalKeys++
@@ -158,7 +194,7 @@ func lookup(db *badger.DB) error {
 
 	key, err := hex.DecodeString(opt.keyLookup)
 	if err != nil {
-		return errors.Wrapf(err, "failed to decode key: %q", opt.keyLookup)
+		return y.Wrapf(err, "failed to decode key: %q", opt.keyLookup)
 	}
 
 	iopts := badger.DefaultIteratorOptions
@@ -174,7 +210,7 @@ func lookup(db *badger.DB) error {
 	fmt.Println()
 	item := itr.Item()
 	if err := printKey(item, true); err != nil {
-		return errors.Wrapf(err, "failed to print information about key: %x(%d)",
+		return y.Wrapf(err, "failed to print information about key: %x(%d)",
 			item.Key(), item.Version())
 	}
 
@@ -189,7 +225,7 @@ func lookup(db *badger.DB) error {
 			break
 		}
 		if err := printKey(item, true); err != nil {
-			return errors.Wrapf(err, "failed to print information about key: %x(%d)",
+			return y.Wrapf(err, "failed to print information about key: %x(%d)",
 				item.Key(), item.Version())
 		}
 	}
@@ -211,7 +247,7 @@ func printKey(item *badger.Item, showValue bool) error {
 	if showValue {
 		val, err := item.ValueCopy(nil)
 		if err != nil {
-			return errors.Wrapf(err,
+			return y.Wrapf(err,
 				"failed to copy value of the key: %x(%d)", item.Key(), item.Version())
 		}
 		fmt.Fprintf(&buf, "\n\tvalue: %v", val)
@@ -221,26 +257,56 @@ func printKey(item *badger.Item, showValue bool) error {
 }
 
 func hbytes(sz int64) string {
-	return humanize.Bytes(uint64(sz))
+	return humanize.IBytes(uint64(sz))
 }
 
 func dur(src, dst time.Time) string {
 	return humanize.RelTime(dst, src, "earlier", "later")
 }
 
+func getInfo(fileInfos []os.FileInfo, tid uint64) int64 {
+	fileName := table.IDToFilename(tid)
+	for _, fi := range fileInfos {
+		if filepath.Base(fi.Name()) == fileName {
+			return fi.Size()
+		}
+	}
+	return 0
+}
+
 func tableInfo(dir, valueDir string, db *badger.DB) {
 	// we want all tables with keys count here.
-	tables := db.Tables(true)
+	tables := db.Tables()
+	fileInfos, err := ioutil.ReadDir(dir)
+	y.Check(err)
+
 	fmt.Println()
-	fmt.Println("SSTable [Li, Id, Total Keys including internal keys] " +
+	// Total keys includes the internal keys as well.
+	fmt.Println("SSTable [Li, Id, Total Keys] " +
+		"[Compression Ratio, StaleData Ratio, Uncompressed Size, Index Size, BF Size] " +
 		"[Left Key, Version -> Right Key, Version]")
+	totalIndex := uint64(0)
+	totalBloomFilter := uint64(0)
+	totalCompressionRatio := float64(0.0)
 	for _, t := range tables {
 		lk, lt := y.ParseKey(t.Left), y.ParseTs(t.Left)
 		rk, rt := y.ParseKey(t.Right), y.ParseTs(t.Right)
 
-		fmt.Printf("SSTable [L%d, %03d, %07d] [%20X, v%d -> %20X, v%d]\n",
-			t.Level, t.ID, t.KeyCount, lk, lt, rk, rt)
+		compressionRatio := float64(t.UncompressedSize) /
+			float64(getInfo(fileInfos, t.ID)-int64(t.IndexSz))
+		staleDataRatio := float64(t.StaleDataSize) / float64(t.UncompressedSize)
+		fmt.Printf("SSTable [L%d, %03d, %07d] [%.2f, %.2f, %s, %s, %s] [%20X, v%d -> %20X, v%d]\n",
+			t.Level, t.ID, t.KeyCount, compressionRatio, staleDataRatio,
+			hbytes(int64(t.UncompressedSize)), hbytes(int64(t.IndexSz)),
+			hbytes(int64(t.BloomFilterSize)), lk, lt, rk, rt)
+		totalIndex += uint64(t.IndexSz)
+		totalBloomFilter += uint64(t.BloomFilterSize)
+		totalCompressionRatio += compressionRatio
 	}
+	fmt.Println()
+	fmt.Printf("Total Index Size: %s\n", hbytes(int64(totalIndex)))
+	fmt.Printf("Total BloomFilter Size: %s\n", hbytes(int64(totalIndex)))
+	fmt.Printf("Mean Compression Ratio: %.2f\n", totalCompressionRatio/float64(len(tables)))
 	fmt.Println()
 }
 
@@ -260,7 +326,7 @@ func printInfo(dir, valueDir string) error {
 			fp.Close()
 		}
 	}()
-	manifest, truncOffset, err := badger.ReplayManifestFile(fp)
+	manifest, truncOffset, err := badger.ReplayManifestFile(fp, opt.externalMagicVersion)
 	if err != nil {
 		return err
 	}
@@ -313,7 +379,7 @@ func printInfo(dir, valueDir string) error {
 		})
 		for _, tableID := range tableIDs {
 			tableFile := table.IDToFilename(tableID)
-			tm, ok1 := manifest.Tables[tableID]
+			_, ok1 := manifest.Tables[tableID]
 			file, ok2 := fileinfoByName[tableFile]
 			if ok1 && ok2 {
 				fileinfoMarked[tableFile] = true
@@ -325,8 +391,8 @@ func printInfo(dir, valueDir string) error {
 				}
 				levelSizes[level] += fileSize
 				// (Put level on every line to make easier to process with sed/perl.)
-				fmt.Printf("[%25s] %-12s %6s L%d %x%s\n", dur(baseTime, file.ModTime()),
-					tableFile, hbytes(fileSize), level, tm.Checksum, emptyString)
+				fmt.Printf("[%25s] %-12s %6s L%d %s\n", dur(baseTime, file.ModTime()),
+					tableFile, hbytes(fileSize), level, emptyString)
 			} else {
 				fmt.Printf("%s [MISSING]\n", tableFile)
 				numMissing++
@@ -392,13 +458,13 @@ func printInfo(dir, valueDir string) error {
 	}
 
 	fmt.Print("\n[Summary]\n")
-	totalIndexSize := int64(0)
+	totalSSTSize := int64(0)
 	for i, sz := range levelSizes {
 		fmt.Printf("Level %d size: %12s\n", i, hbytes(sz))
-		totalIndexSize += sz
+		totalSSTSize += sz
 	}
 
-	fmt.Printf("Total index size: %8s\n", hbytes(totalIndexSize))
+	fmt.Printf("Total SST size: %10s\n", hbytes(totalSSTSize))
 	fmt.Printf("Value log size: %10s\n", hbytes(valueLogSize))
 	fmt.Println()
 	totalExtra := numExtra + numValueDirExtra
@@ -435,4 +501,21 @@ func pluralFiles(count int) string {
 		return "file"
 	}
 	return "files"
+}
+
+func checksumVerificationMode(cvMode string) options.ChecksumVerificationMode {
+	switch cvMode {
+	case "none":
+		return options.NoVerification
+	case "table":
+		return options.OnTableRead
+	case "block":
+		return options.OnBlockRead
+	case "tableAndblock":
+		return options.OnTableAndBlockRead
+	default:
+		fmt.Printf("Invalid checksum verification mode: %s\n", cvMode)
+		os.Exit(1)
+	}
+	return options.NoVerification
 }

@@ -17,6 +17,7 @@
 package skl
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math/rand"
@@ -28,7 +29,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/dgraph-io/badger/y"
+	"github.com/dgraph-io/badger/v3/y"
 )
 
 const arenaSize = 1 << 20
@@ -41,7 +42,7 @@ func newValue(v int) []byte {
 
 // length iterates over skiplist to give exact size.
 func length(s *Skiplist) int {
-	x := s.getNext(s.head, 0)
+	x := s.getNext(s.getHead(), 0)
 	count := 0
 	for x != nil {
 		count++
@@ -457,6 +458,39 @@ func randomKey(rng *rand.Rand) []byte {
 	return y.KeyWithTs(b, 0)
 }
 
+func TestBuilder(t *testing.T) {
+	N := 1 << 16
+	b := NewBuilder(32 << 10)
+	buf := make([]byte, 8)
+	for i := 0; i < N; i++ {
+		binary.BigEndian.PutUint64(buf, uint64(i))
+		key := y.KeyWithTs(buf, 0)
+		b.Add(key, y.ValueStruct{Value: []byte("00072")})
+	}
+	sl := b.s
+	for i := 0; i < N; i++ {
+		binary.BigEndian.PutUint64(buf, uint64(i))
+		key := y.KeyWithTs(buf, 0)
+		v := sl.Get(key)
+		require.NotNil(t, v.Value)
+		require.EqualValues(t, "00072", string(v.Value))
+	}
+	it := sl.NewIterator()
+	defer it.Close()
+
+	require.False(t, it.Valid())
+	it.SeekToFirst()
+	i := 0
+	for it.Valid() {
+		binary.BigEndian.PutUint64(buf, uint64(i))
+		key := y.KeyWithTs(buf, 0)
+		require.Equal(t, key, it.Key())
+		it.Next()
+		i++
+	}
+	require.Equal(t, N, i)
+}
+
 // Standard test. Some fraction is read. Some fraction is write. Writes have
 // to go through mutex lock.
 func BenchmarkReadWrite(b *testing.B) {
@@ -499,7 +533,7 @@ func BenchmarkReadWriteMap(b *testing.B) {
 			b.RunParallel(func(pb *testing.PB) {
 				rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 				for pb.Next() {
-					if rand.Float32() < readFrac {
+					if rng.Float32() < readFrac {
 						mutex.RLock()
 						_, ok := m[string(randomKey(rng))]
 						mutex.RUnlock()
@@ -515,4 +549,63 @@ func BenchmarkReadWriteMap(b *testing.B) {
 			})
 		})
 	}
+}
+
+func BenchmarkWrite(b *testing.B) {
+	value := newValue(123)
+	l := NewSkiplist(int64((b.N + 1) * MaxNodeSize))
+	defer l.DecrRef()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+		for pb.Next() {
+			l.Put(randomKey(rng), y.ValueStruct{Value: value, Meta: 0, UserMeta: 0})
+		}
+	})
+}
+
+// $ go test -run=XXX -v -bench BenchmarkSortedWrites
+//
+// BenchmarkSortedWrites/builder-8         	11298607	       106 ns/op
+// BenchmarkSortedWrites/skiplist-8        	 2523454	       495 ns/op
+// BenchmarkSortedWrites/buffer-8          	10377798	       108 ns/op
+
+func BenchmarkSortedWrites(b *testing.B) {
+	b.Run("builder", func(b *testing.B) {
+		bl := NewBuilder(int64((b.N + 1) * MaxNodeSize))
+		buf := make([]byte, 8)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			binary.BigEndian.PutUint64(buf, uint64(i))
+			key := y.KeyWithTs(buf, 0)
+			bl.Add(key, y.ValueStruct{Value: []byte("00072")})
+		}
+	})
+
+	b.Run("skiplist", func(b *testing.B) {
+		bl := NewSkiplist(int64((b.N + 1) * MaxNodeSize))
+		buf := make([]byte, 8)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			binary.BigEndian.PutUint64(buf, uint64(i))
+			key := y.KeyWithTs(buf, 0)
+			bl.Put(key, y.ValueStruct{Value: []byte("00072")})
+		}
+	})
+
+	b.Run("buffer", func(b *testing.B) {
+		var bl bytes.Buffer
+		buf := make([]byte, 8)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			binary.BigEndian.PutUint64(buf, uint64(i))
+			key := y.KeyWithTs(buf, 0)
+			v := y.ValueStruct{Value: []byte("00072")}
+			vbuf := make([]byte, v.EncodedSize())
+			v.Encode(vbuf)
+
+			kv := append(key, vbuf...)
+			bl.Write(kv)
+		}
+	})
 }

@@ -17,17 +17,18 @@
 package badger
 
 import (
-	"math"
+	"encoding/hex"
+	"fmt"
 	"sync"
 
-	"github.com/dgraph-io/badger/pb"
-	"github.com/dgraph-io/badger/table"
-	"github.com/dgraph-io/badger/y"
+	"github.com/dgraph-io/badger/v3/pb"
+	"github.com/dgraph-io/badger/v3/table"
+	"github.com/dgraph-io/badger/v3/y"
+	"github.com/dgraph-io/ristretto/z"
 	humanize "github.com/dustin/go-humanize"
+	"github.com/golang/protobuf/proto"
 	"github.com/pkg/errors"
 )
-
-const headStreamId uint32 = math.MaxUint32
 
 // StreamWriter is used to write data coming from multiple streams. The streams must not have any
 // overlapping key ranges. Within each stream, the keys must be sorted. Badger Stream framework is
@@ -41,13 +42,18 @@ const headStreamId uint32 = math.MaxUint32
 // StreamWriter should not be called on in-use DB instances. It is designed only to bootstrap new
 // DBs.
 type StreamWriter struct {
-	writeLock  sync.Mutex
-	db         *DB
-	done       func()
-	throttle   *y.Throttle
-	maxVersion uint64
-	writers    map[uint32]*sortedWriter
-	closer     *y.Closer
+	writeLock       sync.Mutex
+	db              *DB
+	done            func()
+	throttle        *y.Throttle
+	maxVersion      uint64
+	writers         map[uint32]*sortedWriter
+	prevLevel       int
+	senderPrevLevel int
+	keyId           map[uint64]*pb.DataKey // map to store stores reader's keyId to data key.
+	// Writer might receive tables first, and then receive keys. If true, that means we have
+	// started processing keys.
+	processingKeys bool
 }
 
 // NewStreamWriter creates a StreamWriter. Right after creating StreamWriter, Prepare must be
@@ -61,32 +67,148 @@ func (db *DB) NewStreamWriter() *StreamWriter {
 		// concurrent streams being processed.
 		throttle: y.NewThrottle(16),
 		writers:  make(map[uint32]*sortedWriter),
-		closer:   y.NewCloser(0),
+		keyId:    make(map[uint64]*pb.DataKey),
 	}
 }
 
 // Prepare should be called before writing any entry to StreamWriter. It deletes all data present in
 // existing DB, stops compactions and any writes being done by other means. Be very careful when
 // calling Prepare, because it could result in permanent data loss. Not calling Prepare would result
-// in a corrupt Badger instance.
+// in a corrupt Badger instance. Use PrepareIncremental to do incremental stream write.
 func (sw *StreamWriter) Prepare() error {
 	sw.writeLock.Lock()
 	defer sw.writeLock.Unlock()
 
-	var err error
-	sw.done, err = sw.db.dropAll()
+	done, err := sw.db.dropAll()
+	// Ensure that done() is never called more than once.
+	var once sync.Once
+	sw.done = func() { once.Do(done) }
 	return err
+}
+
+// PrepareIncremental should be called before writing any entry to StreamWriter incrementally.
+// In incremental stream write, the tables are written at one level above the current base level.
+func (sw *StreamWriter) PrepareIncremental() error {
+	sw.writeLock.Lock()
+	defer sw.writeLock.Unlock()
+
+	// Ensure that done() is never called more than once.
+	var once sync.Once
+
+	// prepareToDrop will stop all the incoming writes and process any pending flush tasks.
+	// Before we start writing, we'll stop the compactions because no one else should be writing to
+	// the same level as the stream writer is writing to.
+	f, err := sw.db.prepareToDrop()
+	if err != nil {
+		sw.done = func() { once.Do(f) }
+		return err
+	}
+	sw.db.stopCompactions()
+	done := func() {
+		sw.db.startCompactions()
+		f()
+	}
+	sw.done = func() { once.Do(done) }
+
+	isEmptyDB := true
+	for _, level := range sw.db.Levels() {
+		if level.NumTables > 0 {
+			sw.prevLevel = level.Level
+			isEmptyDB = false
+			break
+		}
+	}
+	if isEmptyDB {
+		// If DB is empty, we should allow doing incremental stream write.
+		return nil
+	}
+	if sw.prevLevel == 0 {
+		return fmt.Errorf("Unable to do incremental writes because L0 has data")
+	}
+	return nil
 }
 
 // Write writes KVList to DB. Each KV within the list contains the stream id which StreamWriter
 // would use to demux the writes. Write is thread safe and can be called concurrently by multiple
 // goroutines.
-func (sw *StreamWriter) Write(kvs *pb.KVList) error {
-	if len(kvs.GetKv()) == 0 {
+func (sw *StreamWriter) Write(buf *z.Buffer) error {
+	if buf.LenNoPadding() == 0 {
 		return nil
 	}
+
+	// closedStreams keeps track of all streams which are going to be marked as done. We are
+	// keeping track of all streams so that we can close them at the end, after inserting all
+	// the valid kvs.
+	closedStreams := make(map[uint32]struct{})
 	streamReqs := make(map[uint32]*request)
-	for _, kv := range kvs.Kv {
+
+	err := buf.SliceIterate(func(s []byte) error {
+		var kv pb.KV
+		if err := kv.Unmarshal(s); err != nil {
+			return err
+		}
+		if kv.StreamDone {
+			closedStreams[kv.StreamId] = struct{}{}
+			return nil
+		}
+
+		// Panic if some kv comes after stream has been marked as closed.
+		if _, ok := closedStreams[kv.StreamId]; ok {
+			panic(fmt.Sprintf("write performed on closed stream: %d", kv.StreamId))
+		}
+		switch kv.Kind {
+		case pb.KV_DATA_KEY:
+			y.AssertTrue(len(sw.db.opt.EncryptionKey) > 0)
+			var dk pb.DataKey
+			if err := proto.Unmarshal(kv.Value, &dk); err != nil {
+				return errors.Wrapf(err, "unmarshal failed %s", kv.Value)
+			}
+			readerId := dk.KeyId
+			if _, ok := sw.keyId[readerId]; !ok {
+				// Insert the data key to the key registry if not already inserted.
+				id, err := sw.db.registry.AddKey(dk)
+				if err != nil {
+					return errors.Wrap(err, "failed to write data key")
+				}
+				dk.KeyId = id
+				sw.keyId[readerId] = &dk
+			}
+			return nil
+		case pb.KV_FILE:
+			// All tables should be recieved before any of the keys.
+			if sw.processingKeys {
+				return errors.New("Received pb.KV_FILE after pb.KV_KEY")
+			}
+			var change pb.ManifestChange
+			if err := proto.Unmarshal(kv.Key, &change); err != nil {
+				return errors.Wrap(err, "unable to unmarshal manifest change")
+			}
+			level := int(change.Level)
+			if sw.senderPrevLevel == 0 {
+				// We received the first file, set the sender's and receiver's max levels.
+				sw.senderPrevLevel = level
+				sw.prevLevel = len(sw.db.lc.levels) - 1
+			}
+
+			// This is based on the assumption that the tables from the last
+			// level will be sent first and then the second last level tables.
+			// As long as the kv.Version (which stores the level) is same as
+			// the prevLevel, we know we're processing a last level table.
+			// The last level for this DB can be 8 while the DB that's sending
+			// this could have the last level at 7.
+			if sw.senderPrevLevel != level {
+				// If the previous level and the current level is different, we
+				// must be processing a table from the next last level.
+				sw.senderPrevLevel = level
+				sw.prevLevel--
+			}
+			dk := sw.keyId[change.KeyId]
+			return sw.db.lc.AddTable(&kv, sw.prevLevel, dk, &change)
+		case pb.KV_KEY:
+			// Pass. The following code will handle the keys.
+		}
+
+		sw.processingKeys = true
 		var meta, userMeta byte
 		if len(kv.Meta) > 0 {
 			meta = kv.Meta[0]
@@ -99,39 +221,82 @@ func (sw *StreamWriter) Write(kvs *pb.KVList) error {
 		}
 		e := &Entry{
 			Key:       y.KeyWithTs(kv.Key, kv.Version),
-			Value:     kv.Value,
+			Value:     y.Copy(kv.Value),
 			UserMeta:  userMeta,
 			ExpiresAt: kv.ExpiresAt,
 			meta:      meta,
 		}
-		// If the value can be colocated with the key in LSM tree, we can skip
+		// If the value can be collocated with the key in LSM tree, we can skip
 		// writing the value to value log.
-		e.skipVlog = sw.db.shouldWriteValueToLSM(*e)
 		req := streamReqs[kv.StreamId]
 		if req == nil {
 			req = &request{}
 			streamReqs[kv.StreamId] = req
 		}
 		req.Entries = append(req.Entries, e)
+		return nil
+	})
+	if err != nil {
+		return err
 	}
-	var all []*request
+
+	all := make([]*request, 0, len(streamReqs))
 	for _, req := range streamReqs {
 		all = append(all, req)
 	}
 
 	sw.writeLock.Lock()
 	defer sw.writeLock.Unlock()
+
+	// We are writing all requests to vlog even if some request belongs to already closed stream.
+	// It is safe to do because we are panicking while writing to sorted writer, which will be nil
+	// for closed stream. At restart, stream writer will drop all the data in Prepare function.
 	if err := sw.db.vlog.write(all); err != nil {
 		return err
 	}
 
-	for streamId, req := range streamReqs {
+	// Moved this piece of code to within the lock.
+	if sw.prevLevel == 0 {
+		// If prevLevel is 0, that means that we have not written anything yet.
+		// So, we can write to the maxLevel. newWriter writes to prevLevel - 1,
+		// so we can set prevLevel to len(levels).
+		sw.prevLevel = len(sw.db.lc.levels)
+	}
+
+	for streamID, req := range streamReqs {
+		writer, ok := sw.writers[streamID]
+		if !ok {
+			var err error
+			writer, err = sw.newWriter(streamID)
+			if err != nil {
+				return y.Wrapf(err, "failed to create writer with ID %d", streamID)
+			}
+			sw.writers[streamID] = writer
+		}
+
+		if writer == nil {
+			panic(fmt.Sprintf("write performed on closed stream: %d", streamID))
+		}
+
+		writer.reqCh <- req
+	}
+
+	// Now we can close any streams if required. We will make writer for
+	// the closed streams as nil.
+	for streamId := range closedStreams {
 		writer, ok := sw.writers[streamId]
 		if !ok {
-			writer = sw.newWriter(streamId)
-			sw.writers[streamId] = writer
+			sw.db.opt.Logger.Warningf("Trying to close stream: %d, but no sorted "+
+				"writer found for it", streamId)
+			continue
 		}
-		writer.reqCh <- req
+
+		writer.closer.SignalAndWait()
+		if err := writer.Done(); err != nil {
+			return err
+		}
+
+		sw.writers[streamId] = nil
 	}
 	return nil
 }
@@ -144,27 +309,19 @@ func (sw *StreamWriter) Flush() error {
 
 	defer sw.done()
 
-	sw.closer.SignalAndWait()
-	var maxHead valuePointer
 	for _, writer := range sw.writers {
-		if err := writer.Done(); err != nil {
-			return err
-		}
-		if maxHead.Less(writer.head) {
-			maxHead = writer.head
+		if writer != nil {
+			writer.closer.SignalAndWait()
 		}
 	}
 
-	// Encode and write the value log head into a new table.
-	data := maxHead.Encode()
-	headWriter := sw.newWriter(headStreamId)
-	if err := headWriter.Add(
-		y.KeyWithTs(head, sw.maxVersion),
-		y.ValueStruct{Value: data}); err != nil {
-		return err
-	}
-	if err := headWriter.Done(); err != nil {
-		return err
+	for _, writer := range sw.writers {
+		if writer == nil {
+			continue
+		}
+		if err := writer.Done(); err != nil {
+			return err
+		}
 	}
 
 	if !sw.db.opt.managedTxns {
@@ -183,62 +340,97 @@ func (sw *StreamWriter) Flush() error {
 		return err
 	}
 
+	// Sort tables at the end.
+	for _, l := range sw.db.lc.levels {
+		l.sortTables()
+	}
+
 	// Now sync the directories, so all the files are registered.
 	if sw.db.opt.ValueDir != sw.db.opt.Dir {
-		if err := syncDir(sw.db.opt.ValueDir); err != nil {
+		if err := sw.db.syncDir(sw.db.opt.ValueDir); err != nil {
 			return err
 		}
 	}
-	if err := syncDir(sw.db.opt.Dir); err != nil {
+	if err := sw.db.syncDir(sw.db.opt.Dir); err != nil {
 		return err
 	}
 	return sw.db.lc.validate()
 }
 
+// Cancel signals all goroutines to exit. Calling defer sw.Cancel() immediately after creating a new StreamWriter
+// ensures that writes are unblocked even upon early return. Note that dropAll() is not called here, so any
+// partially written data will not be erased until a new StreamWriter is initialized.
+func (sw *StreamWriter) Cancel() {
+	sw.writeLock.Lock()
+	defer sw.writeLock.Unlock()
+
+	for _, writer := range sw.writers {
+		if writer != nil {
+			writer.closer.Signal()
+		}
+	}
+	for _, writer := range sw.writers {
+		if writer != nil {
+			writer.closer.Wait()
+		}
+	}
+
+	if err := sw.throttle.Finish(); err != nil {
+		sw.db.opt.Errorf("error in throttle.Finish: %+v", err)
+	}
+
+	// Handle Cancel() being called before Prepare().
+	if sw.done != nil {
+		sw.done()
+	}
+}
+
 type sortedWriter struct {
 	db       *DB
 	throttle *y.Throttle
+	opts     table.Options
 
 	builder  *table.Builder
 	lastKey  []byte
-	streamId uint32
+	level    int
+	streamID uint32
 	reqCh    chan *request
-	head     valuePointer
+	// Have separate closer for each writer, as it can be closed at any time.
+	closer *z.Closer
 }
 
-func (sw *StreamWriter) newWriter(streamId uint32) *sortedWriter {
-	bopts := table.Options{
-		BlockSize:          sw.db.opt.BlockSize,
-		BloomFalsePositive: sw.db.opt.BloomFalsePositive,
+func (sw *StreamWriter) newWriter(streamID uint32) (*sortedWriter, error) {
+	bopts := buildTableOptions(sw.db)
+	for i := 2; i < sw.db.opt.MaxLevels; i++ {
+		bopts.TableSize *= uint64(sw.db.opt.TableSizeMultiplier)
 	}
 	w := &sortedWriter{
 		db:       sw.db,
-		streamId: streamId,
+		opts:     bopts,
+		streamID: streamID,
 		throttle: sw.throttle,
 		builder:  table.NewTableBuilder(bopts),
 		reqCh:    make(chan *request, 3),
+		closer:   z.NewCloser(1),
+		level:    sw.prevLevel - 1, // Write at the level just above the one we were writing to.
 	}
-	sw.closer.AddRunning(1)
-	go w.handleRequests(sw.closer)
-	return w
+
+	go w.handleRequests()
+	return w, nil
 }
 
-// ErrUnsortedKey is returned when any out of order key arrives at sortedWriter during call to Add.
-var ErrUnsortedKey = errors.New("Keys not in sorted order")
-
-func (w *sortedWriter) handleRequests(closer *y.Closer) {
-	defer closer.Done()
+func (w *sortedWriter) handleRequests() {
+	defer w.closer.Done()
 
 	process := func(req *request) {
 		for i, e := range req.Entries {
-			vptr := req.Ptrs[i]
-			if !vptr.IsZero() {
-				y.AssertTrue(w.head.Less(vptr))
-				w.head = vptr
-			}
-
+			// If badger is running in InMemory mode, len(req.Ptrs) == 0.
 			var vs y.ValueStruct
-			if e.skipVlog {
+			// Sorted stream writer receives Key-Value (not a pointer to value). So, its upto the
+			// writer (and not the sender) to determine if the Value goes to vlog or stays in SST
+			// only. In managed mode, we do not write values to vlog and hence we would not have
+			// req.Ptrs initialized.
+			if w.db.opt.managedTxns || e.skipVlogAndSetThreshold(w.db.valueThreshold()) {
 				vs = y.ValueStruct{
 					Value:     e.Value,
 					Meta:      e.meta,
@@ -246,6 +438,7 @@ func (w *sortedWriter) handleRequests(closer *y.Closer) {
 					ExpiresAt: e.ExpiresAt,
 				}
 			} else {
+				vptr := req.Ptrs[i]
 				vs = y.ValueStruct{
 					Value:     vptr.Encode(),
 					Meta:      e.meta | bitValuePointer,
@@ -263,7 +456,7 @@ func (w *sortedWriter) handleRequests(closer *y.Closer) {
 		select {
 		case req := <-w.reqCh:
 			process(req)
-		case <-closer.HasBeenClosed():
+		case <-w.closer.HasBeenClosed():
 			close(w.reqCh)
 			for req := range w.reqCh {
 				process(req)
@@ -276,37 +469,45 @@ func (w *sortedWriter) handleRequests(closer *y.Closer) {
 // Add adds key and vs to sortedWriter.
 func (w *sortedWriter) Add(key []byte, vs y.ValueStruct) error {
 	if len(w.lastKey) > 0 && y.CompareKeys(key, w.lastKey) <= 0 {
-		return ErrUnsortedKey
+		return errors.Errorf("keys not in sorted order (last key: %s, key: %s)",
+			hex.Dump(w.lastKey), hex.Dump(key))
 	}
 
 	sameKey := y.SameKey(key, w.lastKey)
+
 	// Same keys should go into the same SSTable.
-	if !sameKey && w.builder.ReachedCapacity(w.db.opt.MaxTableSize) {
-		if err := w.send(); err != nil {
+	if !sameKey && w.builder.ReachedCapacity() {
+		if err := w.send(false); err != nil {
 			return err
 		}
 	}
 
 	w.lastKey = y.SafeCopy(w.lastKey, key)
-	w.builder.Add(key, vs)
+	var vp valuePointer
+	if vs.Meta&bitValuePointer > 0 {
+		vp.Decode(vs.Value)
+	}
+
+	w.builder.Add(key, vs, vp.Len)
 	return nil
 }
 
-func (w *sortedWriter) send() error {
+func (w *sortedWriter) send(done bool) error {
 	if err := w.throttle.Do(); err != nil {
 		return err
 	}
 	go func(builder *table.Builder) {
-		data := builder.Finish()
-		err := w.createTable(data)
+		err := w.createTable(builder)
 		w.throttle.Done(err)
 	}(w.builder)
-
-	bopts := table.Options{
-		BlockSize:          w.db.opt.BlockSize,
-		BloomFalsePositive: w.db.opt.BloomFalsePositive,
+	// If done is true, this indicates we can close the writer.
+	// No need to allocate underlying TableBuilder now.
+	if done {
+		w.builder = nil
+		return nil
 	}
-	w.builder = table.NewTableBuilder(bopts)
+
+	w.builder = table.NewTableBuilder(w.opts)
 	return nil
 }
 
@@ -314,71 +515,59 @@ func (w *sortedWriter) send() error {
 // to sortedWriter. It completes writing current SST to disk.
 func (w *sortedWriter) Done() error {
 	if w.builder.Empty() {
+		w.builder.Close()
+		// Assign builder as nil, so that underlying memory can be garbage collected.
+		w.builder = nil
 		return nil
 	}
-	return w.send()
+
+	return w.send(true)
 }
 
-func (w *sortedWriter) createTable(data []byte) error {
-	if len(data) == 0 {
+func (w *sortedWriter) createTable(builder *table.Builder) error {
+	defer builder.Close()
+	if builder.Empty() {
+		builder.Finish()
 		return nil
 	}
-	fileID := w.db.lc.reserveFileID()
-	fd, err := y.CreateSyncedFile(table.NewFilename(fileID, w.db.opt.Dir), true)
-	if err != nil {
-		return err
-	}
-	if _, err := fd.Write(data); err != nil {
-		return err
-	}
 
-	opts := table.Options{
-		LoadingMode: w.db.opt.TableLoadingMode,
-		ChkMode:     w.db.opt.ChecksumVerificationMode,
-	}
-	tbl, err := table.OpenTable(fd, opts)
-	if err != nil {
-		return err
+	fileID := w.db.lc.reserveFileID()
+	var tbl *table.Table
+	if w.db.opt.InMemory {
+		data := builder.Finish()
+		var err error
+		if tbl, err = table.OpenInMemoryTable(data, fileID, builder.Opts()); err != nil {
+			return err
+		}
+	} else {
+		var err error
+		fname := table.NewFilename(fileID, w.db.opt.Dir)
+		if tbl, err = table.CreateTable(fname, builder); err != nil {
+			return err
+		}
 	}
 	lc := w.db.lc
 
-	var lhandler *levelHandler
-	// We should start the levels from 1, because we need level 0 to set the !badger!head key. We
-	// cannot mix up this key with other keys from the DB, otherwise we would introduce a range
-	// overlap violation.
-	y.AssertTrue(len(lc.levels) > 1)
-	for _, l := range lc.levels[1:] {
-		ratio := float64(l.getTotalSize()) / float64(l.maxTotalSize)
-		if ratio < 1.0 {
-			lhandler = l
-			break
-		}
-	}
-	if lhandler == nil {
-		// If we're exceeding the size of the lowest level, shove it in the lowest level. Can't do
-		// better than that.
-		lhandler = lc.levels[len(lc.levels)-1]
-	}
-	if w.streamId == headStreamId {
-		// This is a special !badger!head key. We should store it at level 0, separate from all the
-		// other keys to avoid an overlap.
-		lhandler = lc.levels[0]
-	}
+	lhandler := lc.levels[w.level]
 	// Now that table can be opened successfully, let's add this to the MANIFEST.
 	change := &pb.ManifestChange{
-		Id:    tbl.ID(),
-		Op:    pb.ManifestChange_CREATE,
-		Level: uint32(lhandler.level),
+		Id:          tbl.ID(),
+		KeyId:       tbl.KeyID(),
+		Op:          pb.ManifestChange_CREATE,
+		Level:       uint32(lhandler.level),
+		Compression: uint32(tbl.CompressionType()),
 	}
 	if err := w.db.manifest.addChanges([]*pb.ManifestChange{change}); err != nil {
 		return err
 	}
-	if err := lhandler.replaceTables([]*table.Table{}, []*table.Table{tbl}); err != nil {
-		return err
-	}
+
+	// We are not calling lhandler.replaceTables() here, as it sorts tables on every addition.
+	// We can sort all tables only once during Flush() call.
+	lhandler.addTable(tbl)
+
 	// Release the ref held by OpenTable.
 	_ = tbl.DecrRef()
 	w.db.opt.Infof("Table created: %d at level: %d for stream: %d. Size: %s\n",
-		fileID, lhandler.level, w.streamId, humanize.Bytes(uint64(tbl.Size())))
+		fileID, lhandler.level, w.streamID, humanize.IBytes(uint64(tbl.Size())))
 	return nil
 }

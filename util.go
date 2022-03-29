@@ -23,15 +23,15 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/dgraph-io/badger/table"
-	"github.com/dgraph-io/badger/y"
+	"github.com/dgraph-io/badger/v3/table"
+	"github.com/dgraph-io/badger/v3/y"
 	"github.com/pkg/errors"
 )
 
 func (s *levelsController) validate() error {
 	for _, l := range s.levels {
 		if err := l.validate(); err != nil {
-			return errors.Wrap(err, "Levels Controller")
+			return y.Wrap(err, "Levels Controller")
 		}
 	}
 	return nil
@@ -53,15 +53,16 @@ func (s *levelHandler) validate() error {
 
 		if y.CompareKeys(s.tables[j-1].Biggest(), s.tables[j].Smallest()) >= 0 {
 			return errors.Errorf(
-				"Inter: Biggest(j-1) \n%s\n vs Smallest(j): \n%s\n: level=%d j=%d numTables=%d",
-				hex.Dump(s.tables[j-1].Biggest()), hex.Dump(s.tables[j].Smallest()),
-				s.level, j, numTables)
+				"Inter: Biggest(j-1)[%d] \n%s\n vs Smallest(j)[%d]: \n%s\n: "+
+					"level=%d j=%d numTables=%d",
+				s.tables[j-1].ID(), hex.Dump(s.tables[j-1].Biggest()), s.tables[j].ID(),
+				hex.Dump(s.tables[j].Smallest()), s.level, j, numTables)
 		}
 
 		if y.CompareKeys(s.tables[j].Smallest(), s.tables[j].Biggest()) > 0 {
 			return errors.Errorf(
-				"Intra: %q vs %q: level=%d j=%d numTables=%d",
-				s.tables[j].Smallest(), s.tables[j].Biggest(), s.level, j, numTables)
+				"Intra: \n%s\n vs \n%s\n: level=%d j=%d numTables=%d",
+				hex.Dump(s.tables[j].Smallest()), hex.Dump(s.tables[j].Biggest()), s.level, j, numTables)
 		}
 	}
 	return nil

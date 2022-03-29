@@ -23,12 +23,14 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
 
-	"github.com/dgraph-io/badger/pb"
-	"github.com/dgraph-io/badger/y"
+	"github.com/dgraph-io/badger/v3/options"
+	"github.com/dgraph-io/badger/v3/pb"
+	"github.com/dgraph-io/badger/v3/y"
 	"github.com/golang/protobuf/proto"
 	"github.com/pkg/errors"
 )
@@ -65,11 +67,12 @@ type levelManifest struct {
 	Tables map[uint64]struct{} // Set of table id's
 }
 
-// TableManifest contains information about a specific level
+// TableManifest contains information about a specific table
 // in the LSM tree.
 type TableManifest struct {
-	Level    uint8
-	Checksum []byte
+	Level       uint8
+	KeyID       uint64
+	Compression options.CompressionType
 }
 
 // manifestFile holds the file pointer (and other info) about the manifest file, which is a log
@@ -77,6 +80,10 @@ type TableManifest struct {
 type manifestFile struct {
 	fp        *os.File
 	directory string
+
+	// The external magic number used by the application running badger.
+	externalMagic uint16
+
 	// We make this configurable so that unit tests can hit rewrite() code quickly
 	deletionsRewriteThreshold int
 
@@ -85,6 +92,9 @@ type manifestFile struct {
 
 	// Used to track the current state of the manifest, used when rewriting.
 	manifest Manifest
+
+	// Used to indicate if badger was opened in InMemory mode.
+	inMemory bool
 }
 
 const (
@@ -100,7 +110,7 @@ const (
 func (m *Manifest) asChanges() []*pb.ManifestChange {
 	changes := make([]*pb.ManifestChange, 0, len(m.Tables))
 	for id, tm := range m.Tables {
-		changes = append(changes, newCreateChange(id, int(tm.Level)))
+		changes = append(changes, newCreateChange(id, int(tm.Level), tm.KeyID, tm.Compression))
 	}
 	return changes
 }
@@ -112,18 +122,22 @@ func (m *Manifest) clone() Manifest {
 	return ret
 }
 
-// openOrCreateManifestFile opens a Badger manifest file if it exists, or creates on if
-// one doesn’t.
-func openOrCreateManifestFile(dir string, readOnly bool) (
+// openOrCreateManifestFile opens a Badger manifest file if it exists, or creates one if
+// doesn’t exists.
+func openOrCreateManifestFile(opt Options) (
 	ret *manifestFile, result Manifest, err error) {
-	return helpOpenOrCreateManifestFile(dir, readOnly, manifestDeletionsRewriteThreshold)
+	if opt.InMemory {
+		return &manifestFile{inMemory: true, manifest: createManifest()}, Manifest{}, nil
+	}
+	return helpOpenOrCreateManifestFile(opt.Dir, opt.ReadOnly, opt.ExternalMagicVersion,
+		manifestDeletionsRewriteThreshold)
 }
 
-func helpOpenOrCreateManifestFile(dir string, readOnly bool, deletionsThreshold int) (
-	*manifestFile, Manifest, error) {
+func helpOpenOrCreateManifestFile(dir string, readOnly bool, extMagic uint16,
+	deletionsThreshold int) (*manifestFile, Manifest, error) {
 
 	path := filepath.Join(dir, ManifestFilename)
-	var flags uint32
+	var flags y.Flags
 	if readOnly {
 		flags |= y.ReadOnly
 	}
@@ -136,7 +150,7 @@ func helpOpenOrCreateManifestFile(dir string, readOnly bool, deletionsThreshold 
 			return nil, Manifest{}, fmt.Errorf("no manifest found, required for read-only db")
 		}
 		m := createManifest()
-		fp, netCreations, err := helpRewrite(dir, &m)
+		fp, netCreations, err := helpRewrite(dir, &m, extMagic)
 		if err != nil {
 			return nil, Manifest{}, err
 		}
@@ -144,13 +158,14 @@ func helpOpenOrCreateManifestFile(dir string, readOnly bool, deletionsThreshold 
 		mf := &manifestFile{
 			fp:                        fp,
 			directory:                 dir,
+			externalMagic:             extMagic,
 			manifest:                  m.clone(),
 			deletionsRewriteThreshold: deletionsThreshold,
 		}
 		return mf, m, nil
 	}
 
-	manifest, truncOffset, err := ReplayManifestFile(fp)
+	manifest, truncOffset, err := ReplayManifestFile(fp, extMagic)
 	if err != nil {
 		_ = fp.Close()
 		return nil, Manifest{}, err
@@ -171,6 +186,7 @@ func helpOpenOrCreateManifestFile(dir string, readOnly bool, deletionsThreshold 
 	mf := &manifestFile{
 		fp:                        fp,
 		directory:                 dir,
+		externalMagic:             extMagic,
 		manifest:                  manifest.clone(),
 		deletionsRewriteThreshold: deletionsThreshold,
 	}
@@ -178,6 +194,9 @@ func helpOpenOrCreateManifestFile(dir string, readOnly bool, deletionsThreshold 
 }
 
 func (mf *manifestFile) close() error {
+	if mf.inMemory {
+		return nil
+	}
 	return mf.fp.Close()
 }
 
@@ -191,18 +210,19 @@ func (mf *manifestFile) addChanges(changesParam []*pb.ManifestChange) error {
 	if err != nil {
 		return err
 	}
-
 	// Maybe we could use O_APPEND instead (on certain file systems)
 	mf.appendLock.Lock()
+	defer mf.appendLock.Unlock()
 	if err := applyChangeSet(&mf.manifest, &changes); err != nil {
-		mf.appendLock.Unlock()
 		return err
+	}
+	if mf.inMemory {
+		return nil
 	}
 	// Rewrite manifest if it'd shrink by 1/10 and it's big enough to care
 	if mf.manifest.Deletions > mf.deletionsRewriteThreshold &&
 		mf.manifest.Deletions > manifestDeletionsRatio*(mf.manifest.Creations-mf.manifest.Deletions) {
 		if err := mf.rewrite(); err != nil {
-			mf.appendLock.Unlock()
 			return err
 		}
 	} else {
@@ -211,22 +231,23 @@ func (mf *manifestFile) addChanges(changesParam []*pb.ManifestChange) error {
 		binary.BigEndian.PutUint32(lenCrcBuf[4:8], crc32.Checksum(buf, y.CastagnoliCrcTable))
 		buf = append(lenCrcBuf[:], buf...)
 		if _, err := mf.fp.Write(buf); err != nil {
-			mf.appendLock.Unlock()
 			return err
 		}
 	}
 
-	mf.appendLock.Unlock()
-	return y.FileSync(mf.fp)
+	return syncFunc(mf.fp)
 }
+
+// this function is saved here to allow injection of fake filesystem latency at test time.
+var syncFunc = func(f *os.File) error { return f.Sync() }
 
 // Has to be 4 bytes.  The value can never change, ever, anyway.
 var magicText = [4]byte{'B', 'd', 'g', 'r'}
 
-// The magic version number.
-const magicVersion = 7
+// The magic version number. It is allocated 2 bytes, so it's value must be <= math.MaxUint16
+const badgerMagicVersion = 8
 
-func helpRewrite(dir string, m *Manifest) (*os.File, int, error) {
+func helpRewrite(dir string, m *Manifest, extMagic uint16) (*os.File, int, error) {
 	rewritePath := filepath.Join(dir, manifestRewriteFilename)
 	// We explicitly sync.
 	fp, err := y.OpenTruncFile(rewritePath, false)
@@ -234,9 +255,16 @@ func helpRewrite(dir string, m *Manifest) (*os.File, int, error) {
 		return nil, 0, err
 	}
 
+	// magic bytes are structured as
+	// +---------------------+-------------------------+-----------------------+
+	// | magicText (4 bytes) | externalMagic (2 bytes) | badgerMagic (2 bytes) |
+	// +---------------------+-------------------------+-----------------------+
+
+	y.AssertTrue(badgerMagicVersion <= math.MaxUint16)
 	buf := make([]byte, 8)
 	copy(buf[0:4], magicText[:])
-	binary.BigEndian.PutUint32(buf[4:8], magicVersion)
+	binary.BigEndian.PutUint16(buf[4:6], extMagic)
+	binary.BigEndian.PutUint16(buf[6:8], badgerMagicVersion)
 
 	netCreations := len(m.Tables)
 	changes := m.asChanges()
@@ -256,7 +284,7 @@ func helpRewrite(dir string, m *Manifest) (*os.File, int, error) {
 		fp.Close()
 		return nil, 0, err
 	}
-	if err := y.FileSync(fp); err != nil {
+	if err := fp.Sync(); err != nil {
 		fp.Close()
 		return nil, 0, err
 	}
@@ -291,7 +319,7 @@ func (mf *manifestFile) rewrite() error {
 	if err := mf.fp.Close(); err != nil {
 		return err
 	}
-	fp, netCreations, err := helpRewrite(mf.directory, &mf.manifest)
+	fp, netCreations, err := helpRewrite(mf.directory, &mf.manifest, mf.externalMagic)
 	if err != nil {
 		return err
 	}
@@ -331,7 +359,7 @@ var (
 // Also, returns the last offset after a completely read manifest entry -- the file must be
 // truncated at that point before further appends are made (if there is a partial entry after
 // that).  In normal conditions, truncOffset is the file size.
-func ReplayManifestFile(fp *os.File) (Manifest, int64, error) {
+func ReplayManifestFile(fp *os.File, extMagic uint16) (Manifest, int64, error) {
 	r := countingReader{wrapped: bufio.NewReader(fp)}
 
 	var magicBuf [8]byte
@@ -341,14 +369,27 @@ func ReplayManifestFile(fp *os.File) (Manifest, int64, error) {
 	if !bytes.Equal(magicBuf[0:4], magicText[:]) {
 		return Manifest{}, 0, errBadMagic
 	}
-	version := y.BytesToU32(magicBuf[4:8])
-	if version != magicVersion {
+
+	extVersion := y.BytesToU16(magicBuf[4:6])
+	version := y.BytesToU16(magicBuf[6:8])
+
+	if version != badgerMagicVersion {
 		return Manifest{}, 0,
 			//nolint:lll
 			fmt.Errorf("manifest has unsupported version: %d (we support %d).\n"+
 				"Please see https://github.com/dgraph-io/badger/blob/master/README.md#i-see-manifest-has-unsupported-version-x-we-support-y-error"+
 				" on how to fix this.",
-				version, magicVersion)
+				version, badgerMagicVersion)
+	}
+	if extVersion != extMagic {
+		return Manifest{}, 0,
+			fmt.Errorf("Cannot open DB because the external magic number doesn't match. "+
+				"Expected: %d, version present in manifest: %d\n", extMagic, extVersion)
+	}
+
+	stat, err := fp.Stat()
+	if err != nil {
+		return Manifest{}, 0, err
 	}
 
 	build := createManifest()
@@ -364,6 +405,12 @@ func ReplayManifestFile(fp *os.File) (Manifest, int64, error) {
 			return Manifest{}, 0, err
 		}
 		length := y.BytesToU32(lenCrcBuf[0:4])
+		// Sanity check to ensure we don't over-allocate memory.
+		if length > uint32(stat.Size()) {
+			return Manifest{}, 0, errors.Errorf(
+				"Buffer length: %d greater than file size: %d. Manifest file might be corrupted",
+				length, stat.Size())
+		}
 		var buf = make([]byte, length)
 		if _, err := io.ReadFull(&r, buf); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
@@ -395,7 +442,9 @@ func applyManifestChange(build *Manifest, tc *pb.ManifestChange) error {
 			return fmt.Errorf("MANIFEST invalid, table %d exists", tc.Id)
 		}
 		build.Tables[tc.Id] = TableManifest{
-			Level: uint8(tc.Level),
+			Level:       uint8(tc.Level),
+			KeyID:       tc.KeyId,
+			Compression: options.CompressionType(tc.Compression),
 		}
 		for len(build.Levels) <= int(tc.Level) {
 			build.Levels = append(build.Levels, levelManifest{make(map[uint64]struct{})})
@@ -427,11 +476,16 @@ func applyChangeSet(build *Manifest, changeSet *pb.ManifestChangeSet) error {
 	return nil
 }
 
-func newCreateChange(id uint64, level int) *pb.ManifestChange {
+func newCreateChange(
+	id uint64, level int, keyID uint64, c options.CompressionType) *pb.ManifestChange {
 	return &pb.ManifestChange{
 		Id:    id,
 		Op:    pb.ManifestChange_CREATE,
 		Level: uint32(level),
+		KeyId: keyID,
+		// Hard coding it, since we're supporting only AES for now.
+		EncryptionAlgo: pb.EncryptionAlgo_aes,
+		Compression:    uint32(c),
 	}
 }
 

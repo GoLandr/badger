@@ -21,11 +21,8 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/dgryski/go-farm"
-
-	"github.com/dgraph-io/badger/table"
-	"github.com/dgraph-io/badger/y"
-	"github.com/pkg/errors"
+	"github.com/dgraph-io/badger/v3/table"
+	"github.com/dgraph-io/badger/v3/y"
 )
 
 type levelHandler struct {
@@ -35,14 +32,24 @@ type levelHandler struct {
 	// For level >= 1, tables are sorted by key ranges, which do not overlap.
 	// For level 0, tables are sorted by time.
 	// For level 0, newest table are at the back. Compact the oldest one first, which is at the front.
-	tables    []*table.Table
-	totalSize int64
+	tables         []*table.Table
+	totalSize      int64
+	totalStaleSize int64
 
 	// The following are initialized once and const.
-	level        int
-	strLevel     string
-	maxTotalSize int64
-	db           *DB
+	level    int
+	strLevel string
+	db       *DB
+}
+
+func (s *levelHandler) isLastLevel() bool {
+	return s.level == s.db.opt.MaxLevels-1
+}
+
+func (s *levelHandler) getTotalStaleSize() int64 {
+	s.RLock()
+	defer s.RUnlock()
+	return s.totalStaleSize
 }
 
 func (s *levelHandler) getTotalSize() int64 {
@@ -58,8 +65,9 @@ func (s *levelHandler) initTables(tables []*table.Table) {
 
 	s.tables = tables
 	s.totalSize = 0
+	s.totalStaleSize = 0
 	for _, t := range tables {
-		s.totalSize += t.Size()
+		s.addSize(t)
 	}
 
 	if s.level == 0 {
@@ -93,7 +101,7 @@ func (s *levelHandler) deleteTables(toDel []*table.Table) error {
 			newTables = append(newTables, t)
 			continue
 		}
-		s.totalSize -= t.Size()
+		s.subtractSize(t)
 	}
 	s.tables = newTables
 
@@ -121,12 +129,12 @@ func (s *levelHandler) replaceTables(toDel, toAdd []*table.Table) error {
 			newTables = append(newTables, t)
 			continue
 		}
-		s.totalSize -= t.Size()
+		s.subtractSize(t)
 	}
 
 	// Increase totalSize first.
 	for _, t := range toAdd {
-		s.totalSize += t.Size()
+		s.addSize(t)
 		t.IncrRef()
 		newTables = append(newTables, t)
 	}
@@ -138,6 +146,31 @@ func (s *levelHandler) replaceTables(toDel, toAdd []*table.Table) error {
 	})
 	s.Unlock() // s.Unlock before we DecrRef tables -- that can be slow.
 	return decrRefs(toDel)
+}
+
+// addTable adds toAdd table to levelHandler. Normally when we add tables to levelHandler, we sort
+// tables based on table.Smallest. This is required for correctness of the system. But in case of
+// stream writer this can be avoided. We can just add tables to levelHandler's table list
+// and after all addTable calls, we can sort table list(check sortTable method).
+// NOTE: levelHandler.sortTables() should be called after call addTable calls are done.
+func (s *levelHandler) addTable(t *table.Table) {
+	s.Lock()
+	defer s.Unlock()
+
+	s.addSize(t) // Increase totalSize first.
+	t.IncrRef()
+	s.tables = append(s.tables, t)
+}
+
+// sortTables sorts tables of levelHandler based on table.Smallest.
+// Normally it should be called after all addTable calls.
+func (s *levelHandler) sortTables() {
+	s.RLock()
+	defer s.RUnlock()
+
+	sort.Slice(s.tables, func(i, j int) bool {
+		return y.CompareKeys(s.tables[i].Smallest(), s.tables[j].Smallest()) < 0
+	})
 }
 
 func decrRefs(tables []*table.Table) error {
@@ -163,17 +196,29 @@ func (s *levelHandler) tryAddLevel0Table(t *table.Table) bool {
 	// Need lock as we may be deleting the first table during a level 0 compaction.
 	s.Lock()
 	defer s.Unlock()
+	// Stall (by returning false) if we are above the specified stall setting for L0.
 	if len(s.tables) >= s.db.opt.NumLevelZeroTablesStall {
 		return false
 	}
 
 	s.tables = append(s.tables, t)
 	t.IncrRef()
-	s.totalSize += t.Size()
+	s.addSize(t)
 
 	return true
 }
 
+// This should be called while holding the lock on the level.
+func (s *levelHandler) addSize(t *table.Table) {
+	s.totalSize += t.Size()
+	s.totalStaleSize += int64(t.StaleDataSize())
+}
+
+// This should be called while holding the lock on the level.
+func (s *levelHandler) subtractSize(t *table.Table) {
+	s.totalSize -= t.Size()
+	s.totalStaleSize -= int64(t.StaleDataSize())
+}
 func (s *levelHandler) numTables() int {
 	s.RLock()
 	defer s.RUnlock()
@@ -185,11 +230,11 @@ func (s *levelHandler) close() error {
 	defer s.RUnlock()
 	var err error
 	for _, t := range s.tables {
-		if closeErr := t.Close(); closeErr != nil && err == nil {
+		if closeErr := t.Close(-1); closeErr != nil && err == nil {
 			err = closeErr
 		}
 	}
-	return errors.Wrap(err, "levelHandler.close")
+	return y.Wrap(err, "levelHandler.close")
 }
 
 // getTableForKey acquires a read-lock to access s.tables. It returns a list of tableHandlers.
@@ -233,18 +278,18 @@ func (s *levelHandler) get(key []byte) (y.ValueStruct, error) {
 	tables, decr := s.getTableForKey(key)
 	keyNoTs := y.ParseKey(key)
 
-	hash := farm.Fingerprint64(keyNoTs)
+	hash := y.Hash(keyNoTs)
 	var maxVs y.ValueStruct
 	for _, th := range tables {
 		if th.DoesNotHave(hash) {
-			y.NumLSMBloomHits.Add(s.strLevel, 1)
+			y.NumLSMBloomHitsAdd(s.db.opt.MetricsEnabled, s.strLevel, 1)
 			continue
 		}
 
-		it := th.NewIterator(false)
+		it := th.NewIterator(0)
 		defer it.Close()
 
-		y.NumLSMGets.Add(s.strLevel, 1)
+		y.NumLSMGetsAdd(s.db.opt.MetricsEnabled, s.strLevel, 1)
 		it.Seek(key)
 		if !it.Valid() {
 			continue
@@ -259,12 +304,16 @@ func (s *levelHandler) get(key []byte) (y.ValueStruct, error) {
 	return maxVs, decr()
 }
 
-// appendIterators appends iterators to an array of iterators, for merging.
+// iterators returns an array of iterators, for merging.
 // Note: This obtains references for the table handlers. Remember to close these iterators.
-func (s *levelHandler) appendIterators(iters []y.Iterator, opt *IteratorOptions) []y.Iterator {
+func (s *levelHandler) iterators(opt *IteratorOptions) []y.Iterator {
 	s.RLock()
 	defer s.RUnlock()
 
+	var topt int
+	if opt.Reverse {
+		topt = table.REVERSED
+	}
 	if s.level == 0 {
 		// Remember to add in reverse order!
 		// The newer table at the end of s.tables should be added first as it takes precedence.
@@ -275,14 +324,41 @@ func (s *levelHandler) appendIterators(iters []y.Iterator, opt *IteratorOptions)
 				out = append(out, t)
 			}
 		}
-		return appendIteratorsReversed(iters, out, opt.Reverse)
+		return iteratorsReversed(out, topt)
 	}
 
 	tables := opt.pickTables(s.tables)
 	if len(tables) == 0 {
-		return iters
+		return nil
 	}
-	return append(iters, table.NewConcatIterator(tables, opt.Reverse))
+	return []y.Iterator{table.NewConcatIterator(tables, topt)}
+}
+
+func (s *levelHandler) getTables(opt *IteratorOptions) []*table.Table {
+	if opt.Reverse {
+		panic("Invalid option for getTables")
+	}
+
+	// Typically this would only be called for the last level.
+	s.RLock()
+	defer s.RUnlock()
+
+	if s.level == 0 {
+		var out []*table.Table
+		for _, t := range s.tables {
+			if opt.pickTable(t) {
+				t.IncrRef()
+				out = append(out, t)
+			}
+		}
+		return out
+	}
+
+	tables := opt.pickTables(s.tables)
+	for _, t := range tables {
+		t.IncrRef()
+	}
+	return tables
 }
 
 type levelHandlerRLocked struct{}

@@ -17,27 +17,30 @@
 package badger
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"testing"
+	"time"
 
-	"golang.org/x/net/trace"
+	otrace "go.opencensus.io/trace"
 
-	"github.com/dgraph-io/badger/options"
-	"github.com/dgraph-io/badger/pb"
-	"github.com/dgraph-io/badger/table"
-	"github.com/dgraph-io/badger/y"
+	"github.com/dgraph-io/badger/v3/options"
+	"github.com/dgraph-io/badger/v3/pb"
+	"github.com/dgraph-io/badger/v3/table"
+	"github.com/dgraph-io/badger/v3/y"
 	"github.com/stretchr/testify/require"
 )
 
 func TestManifestBasic(t *testing.T) {
 	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
-	defer os.RemoveAll(dir)
+	defer removeDir(dir)
 
 	opt := getTestOptions(dir)
 	{
@@ -72,7 +75,7 @@ func TestManifestBasic(t *testing.T) {
 func helpTestManifestFileCorruption(t *testing.T, off int64, errorContent string) {
 	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
-	defer os.RemoveAll(dir)
+	defer removeDir(dir)
 
 	opt := getTestOptions(dir)
 	{
@@ -101,7 +104,7 @@ func TestManifestMagic(t *testing.T) {
 }
 
 func TestManifestVersion(t *testing.T) {
-	helpTestManifestFileCorruption(t, 4, "unsupported version")
+	helpTestManifestFileCorruption(t, 6, "unsupported version")
 }
 
 func TestManifestChecksum(t *testing.T) {
@@ -112,7 +115,7 @@ func key(prefix string, i int) string {
 	return prefix + fmt.Sprintf("%04d", i)
 }
 
-func buildTestTable(t *testing.T, prefix string, n int) *os.File {
+func buildTestTable(t *testing.T, prefix string, n int, opts table.Options) *table.Table {
 	y.AssertTrue(n <= 10000)
 	keyValues := make([][]string, n)
 	for i := 0; i < n; i++ {
@@ -120,24 +123,23 @@ func buildTestTable(t *testing.T, prefix string, n int) *os.File {
 		v := fmt.Sprintf("%d", i)
 		keyValues[i] = []string{k, v}
 	}
-	return buildTable(t, keyValues)
+	return buildTable(t, keyValues, opts)
 }
 
 // TODO - Move these to somewhere where table package can also use it.
 // keyValues is n by 2 where n is number of pairs.
-func buildTable(t *testing.T, keyValues [][]string) *os.File {
-	bopts := table.Options{BlockSize: 4 * 1024, BloomFalsePositive: 0.01}
+func buildTable(t *testing.T, keyValues [][]string, bopts table.Options) *table.Table {
+	if bopts.BloomFalsePositive == 0 {
+		bopts.BloomFalsePositive = 0.01
+	}
+	if bopts.BlockSize == 0 {
+		bopts.BlockSize = 4 * 1024
+	}
 	b := table.NewTableBuilder(bopts)
 	defer b.Close()
 	// TODO: Add test for file garbage collection here. No files should be left after the tests here.
 
-	filename := fmt.Sprintf("%s%s%d.sst", os.TempDir(), string(os.PathSeparator), rand.Int63())
-	f, err := y.OpenSyncedFile(filename, true)
-	if t != nil {
-		require.NoError(t, err)
-	} else {
-		y.Check(err)
-	}
+	filename := fmt.Sprintf("%s%s%d.sst", os.TempDir(), string(os.PathSeparator), rand.Uint32())
 
 	sort.Slice(keyValues, func(i, j int) bool {
 		return keyValues[i][0] < keyValues[j][0]
@@ -148,49 +150,51 @@ func buildTable(t *testing.T, keyValues [][]string) *os.File {
 			Value:    []byte(kv[1]),
 			Meta:     'A',
 			UserMeta: 0,
-		})
+		}, 0)
 	}
-	_, err = f.Write(b.Finish())
-	require.NoError(t, err, "unable to write to file.")
-	f.Close()
-	f, _ = y.OpenSyncedFile(filename, true)
-	return f
+
+	tbl, err := table.CreateTable(filename, b)
+	require.NoError(t, err)
+	return tbl
 }
 
 func TestOverlappingKeyRangeError(t *testing.T) {
 	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
-	defer os.RemoveAll(dir)
+	defer removeDir(dir)
 	kv, err := Open(DefaultOptions(dir))
 	require.NoError(t, err)
+	defer kv.Close()
 
 	lh0 := newLevelHandler(kv, 0)
 	lh1 := newLevelHandler(kv, 1)
-	f := buildTestTable(t, "k", 2)
-	opts := table.Options{LoadingMode: options.MemoryMap, ChkMode: options.OnTableAndBlockRead}
-	t1, err := table.OpenTable(f, opts)
-	require.NoError(t, err)
+	opts := table.Options{ChkMode: options.OnTableAndBlockRead}
+	t1 := buildTestTable(t, "k", 2, opts)
 	defer t1.DecrRef()
 
 	done := lh0.tryAddLevel0Table(t1)
 	require.Equal(t, true, done)
-
+	_, span := otrace.StartSpan(context.Background(), "Badger.Compaction")
+	span.Annotatef(nil, "Compaction level: %v", lh0)
 	cd := compactDef{
 		thisLevel: lh0,
 		nextLevel: lh1,
-		elog:      trace.New("Badger", "Compact"),
+		span:      span,
+		t:         kv.lc.levelTargets(),
 	}
+	cd.t.baseLevel = 1
 
 	manifest := createManifest()
 	lc, err := newLevelsController(kv, &manifest)
 	require.NoError(t, err)
 	done = lc.fillTablesL0(&cd)
 	require.Equal(t, true, done)
-	lc.runCompactDef(0, cd)
+	lc.runCompactDef(-1, 0, cd)
+	span.End()
 
-	f = buildTestTable(t, "l", 2)
-	t2, err := table.OpenTable(f, opts)
-	require.NoError(t, err)
+	_, span = otrace.StartSpan(context.Background(), "Badger.Compaction")
+	span.Annotatef(nil, "Compaction level: %v", lh0)
+	t2 := buildTestTable(t, "l", 2, opts)
 	defer t2.DecrRef()
 	done = lh0.tryAddLevel0Table(t2)
 	require.Equal(t, true, done)
@@ -198,18 +202,20 @@ func TestOverlappingKeyRangeError(t *testing.T) {
 	cd = compactDef{
 		thisLevel: lh0,
 		nextLevel: lh1,
-		elog:      trace.New("Badger", "Compact"),
+		span:      span,
+		t:         kv.lc.levelTargets(),
 	}
+	cd.t.baseLevel = 1
 	lc.fillTablesL0(&cd)
-	lc.runCompactDef(0, cd)
+	lc.runCompactDef(-1, 0, cd)
 }
 
 func TestManifestRewrite(t *testing.T) {
 	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
-	defer os.RemoveAll(dir)
+	defer removeDir(dir)
 	deletionsThreshold := 10
-	mf, m, err := helpOpenOrCreateManifestFile(dir, false, deletionsThreshold)
+	mf, m, err := helpOpenOrCreateManifestFile(dir, false, 0, deletionsThreshold)
 	defer func() {
 		if mf != nil {
 			mf.close()
@@ -220,13 +226,13 @@ func TestManifestRewrite(t *testing.T) {
 	require.Equal(t, 0, m.Deletions)
 
 	err = mf.addChanges([]*pb.ManifestChange{
-		newCreateChange(0, 0),
+		newCreateChange(0, 0, 0, 0),
 	})
 	require.NoError(t, err)
 
 	for i := uint64(0); i < uint64(deletionsThreshold*3); i++ {
 		ch := []*pb.ManifestChange{
-			newCreateChange(i+1, 0),
+			newCreateChange(i+1, 0, 0, 0),
 			newDeleteChange(i),
 		}
 		err := mf.addChanges(ch)
@@ -235,9 +241,50 @@ func TestManifestRewrite(t *testing.T) {
 	err = mf.close()
 	require.NoError(t, err)
 	mf = nil
-	mf, m, err = helpOpenOrCreateManifestFile(dir, false, deletionsThreshold)
+	mf, m, err = helpOpenOrCreateManifestFile(dir, false, 0, deletionsThreshold)
 	require.NoError(t, err)
 	require.Equal(t, map[uint64]TableManifest{
 		uint64(deletionsThreshold * 3): {Level: 0},
 	}, m.Tables)
+}
+
+func TestConcurrentManifestCompaction(t *testing.T) {
+	dir, err := ioutil.TempDir("", "badger-test")
+	require.NoError(t, err)
+	defer removeDir(dir)
+
+	// set this low so rewrites will happen more often
+	deletionsThreshold := 1
+
+	// overwrite the sync function to make this race condition easily reproducible
+	syncFunc = func(f *os.File) error {
+		// effectively making the Sync() take around 1s makes this reproduce every time
+		time.Sleep(1 * time.Second)
+		return f.Sync()
+	}
+
+	mf, _, err := helpOpenOrCreateManifestFile(dir, false, 0, deletionsThreshold)
+	require.NoError(t, err)
+
+	cs := &pb.ManifestChangeSet{}
+	for i := uint64(0); i < 1000; i++ {
+		cs.Changes = append(cs.Changes,
+			newCreateChange(i, 0, 0, 0),
+			newDeleteChange(i),
+		)
+	}
+
+	// simulate 2 concurrent compaction threads
+	n := 2
+	wg := sync.WaitGroup{}
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			require.NoError(t, mf.addChanges(cs.Changes))
+		}()
+	}
+	wg.Wait()
+
+	require.NoError(t, mf.close())
 }

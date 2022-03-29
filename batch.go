@@ -18,8 +18,12 @@ package badger
 
 import (
 	"sync"
+	"sync/atomic"
 
-	"github.com/dgraph-io/badger/y"
+	"github.com/dgraph-io/badger/v3/pb"
+	"github.com/dgraph-io/badger/v3/y"
+	"github.com/dgraph-io/ristretto/z"
+	"github.com/pkg/errors"
 )
 
 // WriteBatch holds the necessary info to perform batched writes.
@@ -28,8 +32,11 @@ type WriteBatch struct {
 	txn      *Txn
 	db       *DB
 	throttle *y.Throttle
-	err      error
-	commitTs uint64
+	err      atomic.Value
+
+	isManaged bool
+	commitTs  uint64
+	finished  bool
 }
 
 // NewWriteBatch creates a new WriteBatch. This provides a way to conveniently do a lot of writes,
@@ -41,14 +48,15 @@ func (db *DB) NewWriteBatch() *WriteBatch {
 	if db.opt.managedTxns {
 		panic("cannot use NewWriteBatch in managed mode. Use NewWriteBatchAt instead")
 	}
-	return db.newWriteBatch()
+	return db.newWriteBatch(false)
 }
 
-func (db *DB) newWriteBatch() *WriteBatch {
+func (db *DB) newWriteBatch(isManaged bool) *WriteBatch {
 	return &WriteBatch{
-		db:       db,
-		txn:      db.newTransaction(true, true),
-		throttle: y.NewThrottle(16),
+		db:        db,
+		isManaged: isManaged,
+		txn:       db.newTransaction(true, isManaged),
+		throttle:  y.NewThrottle(16),
 	}
 }
 
@@ -67,6 +75,9 @@ func (wb *WriteBatch) SetMaxPendingTxns(max int) {
 //
 // Note that any committed writes would still go through despite calling Cancel.
 func (wb *WriteBatch) Cancel() {
+	wb.Lock()
+	defer wb.Unlock()
+	wb.finished = true
 	if err := wb.throttle.Finish(); err != nil {
 		wb.db.opt.Errorf("WatchBatch.Cancel error while finishing: %v", err)
 	}
@@ -79,20 +90,59 @@ func (wb *WriteBatch) callback(err error) {
 	if err == nil {
 		return
 	}
-
-	wb.Lock()
-	defer wb.Unlock()
-	if wb.err != nil {
+	if err := wb.Error(); err != nil {
 		return
 	}
-	wb.err = err
+	wb.err.Store(err)
 }
 
-// SetEntry is the equivalent of Txn.SetEntry.
-func (wb *WriteBatch) SetEntry(e *Entry) error {
+func (wb *WriteBatch) writeKV(kv *pb.KV) error {
+	e := Entry{Key: kv.Key, Value: kv.Value}
+	if len(kv.UserMeta) > 0 {
+		e.UserMeta = kv.UserMeta[0]
+	}
+	y.AssertTrue(kv.Version != 0)
+	e.version = kv.Version
+	return wb.handleEntry(&e)
+}
+
+func (wb *WriteBatch) Write(buf *z.Buffer) error {
 	wb.Lock()
 	defer wb.Unlock()
 
+	err := buf.SliceIterate(func(s []byte) error {
+		kv := &pb.KV{}
+		if err := kv.Unmarshal(s); err != nil {
+			return err
+		}
+		return wb.writeKV(kv)
+	})
+	return err
+}
+
+func (wb *WriteBatch) WriteList(kvList *pb.KVList) error {
+	wb.Lock()
+	defer wb.Unlock()
+	for _, kv := range kvList.Kv {
+		if err := wb.writeKV(kv); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SetEntryAt is the equivalent of Txn.SetEntry but it also allows setting version for the entry.
+// SetEntryAt can be used only in managed mode.
+func (wb *WriteBatch) SetEntryAt(e *Entry, ts uint64) error {
+	if !wb.db.opt.managedTxns {
+		return errors.New("SetEntryAt can only be used in managed mode. Use SetEntry instead")
+	}
+	e.version = ts
+	return wb.SetEntry(e)
+}
+
+// Should be called with lock acquired.
+func (wb *WriteBatch) handleEntry(e *Entry) error {
 	if err := wb.txn.SetEntry(e); err != ErrTxnTooBig {
 		return err
 	}
@@ -103,16 +153,29 @@ func (wb *WriteBatch) SetEntry(e *Entry) error {
 	// This time the error must not be ErrTxnTooBig, otherwise, we make the
 	// error permanent.
 	if err := wb.txn.SetEntry(e); err != nil {
-		wb.err = err
+		wb.err.Store(err)
 		return err
 	}
 	return nil
+}
+
+// SetEntry is the equivalent of Txn.SetEntry.
+func (wb *WriteBatch) SetEntry(e *Entry) error {
+	wb.Lock()
+	defer wb.Unlock()
+	return wb.handleEntry(e)
 }
 
 // Set is equivalent of Txn.Set().
 func (wb *WriteBatch) Set(k, v []byte) error {
 	e := &Entry{Key: k, Value: v}
 	return wb.SetEntry(e)
+}
+
+// DeleteAt is equivalent of Txn.Delete but accepts a delete timestamp.
+func (wb *WriteBatch) DeleteAt(k []byte, ts uint64) error {
+	e := Entry{Key: k, meta: bitDelete, version: ts}
+	return wb.SetEntry(&e)
 }
 
 // Delete is equivalent of Txn.Delete.
@@ -127,7 +190,7 @@ func (wb *WriteBatch) Delete(k []byte) error {
 		return err
 	}
 	if err := wb.txn.Delete(k); err != nil {
-		wb.err = err
+		wb.err.Store(err)
 		return err
 	}
 	return nil
@@ -135,37 +198,48 @@ func (wb *WriteBatch) Delete(k []byte) error {
 
 // Caller to commit must hold a write lock.
 func (wb *WriteBatch) commit() error {
-	if wb.err != nil {
-		return wb.err
+	if err := wb.Error(); err != nil {
+		return err
+	}
+	if wb.finished {
+		return y.ErrCommitAfterFinish
 	}
 	if err := wb.throttle.Do(); err != nil {
+		wb.err.Store(err)
 		return err
 	}
 	wb.txn.CommitWith(wb.callback)
-	wb.txn = wb.db.newTransaction(true, true)
-	wb.txn.readTs = 0 // We're not reading anything.
+	wb.txn = wb.db.newTransaction(true, wb.isManaged)
 	wb.txn.commitTs = wb.commitTs
-	return wb.err
+	return wb.Error()
 }
 
 // Flush must be called at the end to ensure that any pending writes get committed to Badger. Flush
 // returns any error stored by WriteBatch.
 func (wb *WriteBatch) Flush() error {
 	wb.Lock()
-	_ = wb.commit()
+	err := wb.commit()
+	if err != nil {
+		wb.Unlock()
+		return err
+	}
+	wb.finished = true
 	wb.txn.Discard()
 	wb.Unlock()
 
 	if err := wb.throttle.Finish(); err != nil {
+		if wb.Error() != nil {
+			return errors.Errorf("wb.err: %s err: %s", wb.Error(), err)
+		}
 		return err
 	}
 
-	return wb.err
+	return wb.Error()
 }
 
 // Error returns any errors encountered so far. No commits would be run once an error is detected.
 func (wb *WriteBatch) Error() error {
-	wb.Lock()
-	defer wb.Unlock()
-	return wb.err
+	// If the interface conversion fails, the err will be nil.
+	err, _ := wb.err.Load().(error)
+	return err
 }

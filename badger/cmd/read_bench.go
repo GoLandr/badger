@@ -19,18 +19,19 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
-	"strings"
 	"sync/atomic"
 	"time"
 
 	humanize "github.com/dustin/go-humanize"
+	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 
-	"github.com/dgraph-io/badger"
-	"github.com/dgraph-io/badger/options"
-	"github.com/dgraph-io/badger/pb"
-	"github.com/dgraph-io/badger/y"
+	"github.com/dgraph-io/badger/v3"
+	"github.com/dgraph-io/badger/v3/pb"
+	"github.com/dgraph-io/badger/v3/y"
+	"github.com/dgraph-io/ristretto/z"
 )
 
 var readBenchCmd = &cobra.Command{
@@ -46,10 +47,15 @@ var (
 	entriesRead uint64    // will store entries read till now
 	startTime   time.Time // start time of read benchmarking
 
-	sampleSize  int
-	loadingMode string
-	keysOnly    bool
-	readOnly    bool
+	ro = struct {
+		blockCacheSize int64
+		indexCacheSize int64
+
+		sampleSize int
+		keysOnly   bool
+		readOnly   bool
+		fullScan   bool
+	}{}
 )
 
 func init() {
@@ -59,14 +65,35 @@ func init() {
 	readBenchCmd.Flags().StringVarP(
 		&duration, "duration", "d", "1m", "How long to run the benchmark.")
 	readBenchCmd.Flags().IntVar(
-		&sampleSize, "sample-size", 1000000, "Keys sample size to be used for random lookup.")
+		&ro.sampleSize, "sample-size", 1000000, "Keys sample size to be used for random lookup.")
 	readBenchCmd.Flags().BoolVar(
-		&keysOnly, "keys-only", false, "If false, values will also be read.")
+		&ro.keysOnly, "keys-only", false, "If false, values will also be read.")
 	readBenchCmd.Flags().BoolVar(
-		&readOnly, "read-only", true, "If true, DB will be opened in read only mode.")
-	readBenchCmd.Flags().StringVar(
-		&loadingMode, "loading-mode", "mmap", "Mode for accessing SSTables and value log files. "+
-			"Valid loading modes are fileio and mmap.")
+		&ro.readOnly, "read-only", true, "If true, DB will be opened in read only mode.")
+	readBenchCmd.Flags().BoolVar(
+		&ro.fullScan, "full-scan", false, "If true, full db will be scanned using iterators.")
+	readBenchCmd.Flags().Int64Var(&ro.blockCacheSize, "block-cache", 256, "Max size of block cache in MB")
+	readBenchCmd.Flags().Int64Var(&ro.indexCacheSize, "index-cache", 0, "Max size of index cache in MB")
+}
+
+// Scan the whole database using the iterators
+func fullScanDB(db *badger.DB) {
+	txn := db.NewTransactionAt(math.MaxUint64, false)
+	defer txn.Discard()
+
+	startTime = time.Now()
+	// Print the stats
+	c := z.NewCloser(0)
+	c.AddRunning(1)
+	go printStats(c)
+
+	it := txn.NewIterator(badger.DefaultIteratorOptions)
+	defer it.Close()
+	for it.Rewind(); it.Valid(); it.Next() {
+		i := it.Item()
+		atomic.AddUint64(&entriesRead, 1)
+		atomic.AddUint64(&sizeRead, uint64(i.EstimatedSize()))
+	}
 }
 
 func readBench(cmd *cobra.Command, args []string) error {
@@ -77,53 +104,32 @@ func readBench(cmd *cobra.Command, args []string) error {
 		return y.Wrapf(err, "unable to parse duration")
 	}
 	y.AssertTrue(numGoroutines > 0)
-	mode := getLoadingMode(loadingMode)
-
-	db, err := badger.Open(badger.DefaultOptions(sstDir).
+	opt := badger.DefaultOptions(sstDir).
 		WithValueDir(vlogDir).
-		WithReadOnly(readOnly).
-		WithTableLoadingMode(mode).
-		WithValueLogLoadingMode(mode))
+		WithReadOnly(ro.readOnly).
+		WithBlockCacheSize(ro.blockCacheSize << 20).
+		WithIndexCacheSize(ro.indexCacheSize << 20)
+	fmt.Printf("Opening badger with options = %+v\n", opt)
+	db, err := badger.OpenManaged(opt)
 	if err != nil {
 		return y.Wrapf(err, "unable to open DB")
 	}
 	defer db.Close()
 
-	now := time.Now()
-	keys, err := getSampleKeys(db)
-	if err != nil {
-		return y.Wrapf(err, "error while sampling keys")
-	}
-	fmt.Println("*********************************************************")
-	fmt.Printf("Total Sampled Keys: %d, read in time: %s\n", len(keys), time.Since(now))
-	fmt.Println("*********************************************************")
-
-	if len(keys) == 0 {
-		fmt.Println("DB is empty, hence returning")
-		return nil
-	}
-
 	fmt.Println("*********************************************************")
 	fmt.Println("Starting to benchmark Reads")
 	fmt.Println("*********************************************************")
-	c := y.NewCloser(0)
-	startTime = time.Now()
-	for i := 0; i < numGoroutines; i++ {
-		c.AddRunning(1)
-		go readKeys(db, c, keys)
+
+	// if fullScan is true then do a complete scan of the db and return
+	if ro.fullScan {
+		fullScanDB(db)
+		return nil
 	}
-
-	// also start printing stats
-	c.AddRunning(1)
-	go printStats(c)
-
-	<-time.After(dur)
-	c.SignalAndWait()
-
+	readTest(db, dur)
 	return nil
 }
 
-func printStats(c *y.Closer) {
+func printStats(c *z.Closer) {
 	defer c.Done()
 
 	t := time.NewTicker(time.Second)
@@ -140,12 +146,12 @@ func printStats(c *y.Closer) {
 			entriesRate := entries / uint64(dur.Seconds())
 			fmt.Printf("Time elapsed: %s, bytes read: %s, speed: %s/sec, "+
 				"entries read: %d, speed: %d/sec\n", y.FixedDuration(time.Since(startTime)),
-				humanize.Bytes(sz), humanize.Bytes(bytesRate), entries, entriesRate)
+				humanize.IBytes(sz), humanize.IBytes(bytesRate), entries, entriesRate)
 		}
 	}
 }
 
-func readKeys(db *badger.DB, c *y.Closer, keys [][]byte) {
+func readKeys(db *badger.DB, c *z.Closer, keys [][]byte) {
 	defer c.Done()
 	r := rand.New(rand.NewSource(time.Now().Unix()))
 	for {
@@ -162,16 +168,21 @@ func readKeys(db *badger.DB, c *y.Closer, keys [][]byte) {
 
 func lookupForKey(db *badger.DB, key []byte) (sz uint64) {
 	err := db.View(func(txn *badger.Txn) error {
-		itm, err := txn.Get(key)
-		y.Check(err)
+		iopt := badger.DefaultIteratorOptions
+		iopt.AllVersions = true
+		iopt.PrefetchValues = false
+		it := txn.NewKeyIterator(key, iopt)
+		defer it.Close()
 
-		if keysOnly {
-			sz = uint64(itm.KeySize())
-		} else {
-			y.Check2(itm.ValueCopy(nil))
-			sz = uint64(itm.EstimatedSize())
+		cnt := 0
+		for it.Seek(key); it.Valid(); it.Next() {
+			itm := it.Item()
+			sz += uint64(itm.EstimatedSize())
+			cnt++
+			if cnt == 10 {
+				break
+			}
 		}
-
 		return nil
 	})
 	y.Check(err)
@@ -179,10 +190,10 @@ func lookupForKey(db *badger.DB, key []byte) (sz uint64) {
 }
 
 // getSampleKeys uses stream framework internally, to get keys in random order.
-func getSampleKeys(db *badger.DB) ([][]byte, error) {
+func getSampleKeys(db *badger.DB, sampleSize int) ([][]byte, error) {
 	var keys [][]byte
 	count := 0
-	stream := db.NewStream()
+	stream := db.NewStreamAt(math.MaxUint64)
 
 	// overide stream.KeyToList as we only want keys. Also
 	// we can take only first version for the key.
@@ -194,21 +205,30 @@ func getSampleKeys(db *badger.DB) ([][]byte, error) {
 		return l, nil
 	}
 
+	errStop := errors.Errorf("Stop iterating")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	stream.Send = func(l *pb.KVList) error {
-		if count >= sampleSize {
+	stream.Send = func(buf *z.Buffer) error {
+		if count >= ro.sampleSize {
 			return nil
 		}
-		for _, kv := range l.Kv {
+		err := buf.SliceIterate(func(s []byte) error {
+			var kv pb.KV
+			if err := kv.Unmarshal(s); err != nil {
+				return err
+			}
 			keys = append(keys, kv.Key)
 			count++
 			if count >= sampleSize {
 				cancel()
-				return nil
+				return errStop
 			}
+			return nil
+		})
+		if err == errStop || err == nil {
+			return nil
 		}
-		return nil
+		return err
 	}
 
 	if err := stream.Orchestrate(ctx); err != nil && err != context.Canceled {
@@ -222,19 +242,4 @@ func getSampleKeys(db *badger.DB) ([][]byte, error) {
 	})
 
 	return keys, nil
-}
-
-func getLoadingMode(m string) options.FileLoadingMode {
-	m = strings.ToLower(m)
-	var mode options.FileLoadingMode
-	switch m {
-	case "fileio":
-		mode = options.FileIO
-	case "mmap":
-		mode = options.MemoryMap
-	default:
-		panic("loading mode not supported")
-	}
-
-	return mode
 }

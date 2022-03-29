@@ -18,16 +18,22 @@ package badger
 
 import (
 	"sync"
+	"sync/atomic"
 
-	"github.com/dgraph-io/badger/pb"
-	"github.com/dgraph-io/badger/trie"
-	"github.com/dgraph-io/badger/y"
+	"github.com/dgraph-io/badger/v3/pb"
+	"github.com/dgraph-io/badger/v3/trie"
+	"github.com/dgraph-io/badger/v3/y"
+	"github.com/dgraph-io/ristretto/z"
 )
 
 type subscriber struct {
-	prefixes  [][]byte
-	sendCh    chan<- *pb.KVList
-	subCloser *y.Closer
+	id uint64
+	matches   []pb.Match
+	sendCh    chan *pb.KVList
+	subCloser *z.Closer
+	// this will be atomic pointer which will be used to
+	// track whether the subscriber is active or not
+	active    *uint64
 }
 
 type publisher struct {
@@ -47,12 +53,12 @@ func newPublisher() *publisher {
 	}
 }
 
-func (p *publisher) listenForUpdates(c *y.Closer) {
+func (p *publisher) listenForUpdates(c *z.Closer) {
 	defer func() {
 		p.cleanSubscribers()
 		c.Done()
 	}()
-	slurp := func(batch []*request) {
+	slurp := func(batch requests) {
 		for {
 			select {
 			case reqs := <-p.pubCh:
@@ -84,46 +90,53 @@ func (p *publisher) publishUpdates(reqs requests) {
 	for _, req := range reqs {
 		for _, e := range req.Entries {
 			ids := p.indexer.Get(e.Key)
-			if len(ids) > 0 {
-				k := y.SafeCopy(nil, e.Key)
-				kv := &pb.KV{
-					Key:       y.ParseKey(k),
-					Value:     y.SafeCopy(nil, e.Value),
-					Meta:      []byte{e.UserMeta},
-					ExpiresAt: e.ExpiresAt,
-					Version:   y.ParseTs(k),
+			if len(ids) == 0 {
+				continue
+			}
+			k := y.SafeCopy(nil, e.Key)
+			kv := &pb.KV{
+				Key:       y.ParseKey(k),
+				Value:     y.SafeCopy(nil, e.Value),
+				Meta:      []byte{e.UserMeta},
+				ExpiresAt: e.ExpiresAt,
+				Version:   y.ParseTs(k),
+			}
+			for id := range ids {
+				if _, ok := batchedUpdates[id]; !ok {
+					batchedUpdates[id] = &pb.KVList{}
 				}
-				for id := range ids {
-					if _, ok := batchedUpdates[id]; !ok {
-						batchedUpdates[id] = &pb.KVList{}
-					}
-					batchedUpdates[id].Kv = append(batchedUpdates[id].Kv, kv)
-				}
+				batchedUpdates[id].Kv = append(batchedUpdates[id].Kv, kv)
 			}
 		}
 	}
 
 	for id, kvs := range batchedUpdates {
-		p.subscribers[id].sendCh <- kvs
+		if atomic.LoadUint64(p.subscribers[id].active) == 1 {
+			p.subscribers[id].sendCh <- kvs
+		}
 	}
 }
 
-func (p *publisher) newSubscriber(c *y.Closer, prefixes ...[]byte) (<-chan *pb.KVList, uint64) {
+func (p *publisher) newSubscriber(c *z.Closer, matches []pb.Match) subscriber {
 	p.Lock()
 	defer p.Unlock()
 	ch := make(chan *pb.KVList, 1000)
 	id := p.nextID
 	// Increment next ID.
 	p.nextID++
-	p.subscribers[id] = subscriber{
-		prefixes:  prefixes,
+	active := uint64(1)
+	s := subscriber{
+		active: &active,
+		id: id,
+		matches:   matches,
 		sendCh:    ch,
 		subCloser: c,
 	}
-	for _, prefix := range prefixes {
-		p.indexer.Add(prefix, id)
+	p.subscribers[id] = s
+	for _, m := range matches {
+		p.indexer.AddMatch(m, id)
 	}
-	return ch, id
+	return s
 }
 
 // cleanSubscribers stops all the subscribers. Ideally, It should be called while closing DB.
@@ -131,8 +144,8 @@ func (p *publisher) cleanSubscribers() {
 	p.Lock()
 	defer p.Unlock()
 	for id, s := range p.subscribers {
-		for _, prefix := range s.prefixes {
-			p.indexer.Delete(prefix, id)
+		for _, m := range s.matches {
+			p.indexer.DeleteMatch(m, id)
 		}
 		delete(p.subscribers, id)
 		s.subCloser.SignalAndWait()
@@ -143,15 +156,16 @@ func (p *publisher) deleteSubscriber(id uint64) {
 	p.Lock()
 	defer p.Unlock()
 	if s, ok := p.subscribers[id]; ok {
-		for _, prefix := range s.prefixes {
-			p.indexer.Delete(prefix, id)
+		for _, m := range s.matches {
+			p.indexer.DeleteMatch(m, id)
 		}
 	}
 	delete(p.subscribers, id)
 }
 
-func (p *publisher) sendUpdates(reqs []*request) {
+func (p *publisher) sendUpdates(reqs requests) {
 	if p.noOfSubscribers() != 0 {
+		reqs.IncrRef()
 		p.pubCh <- reqs
 	}
 }

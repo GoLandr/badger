@@ -20,7 +20,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dgraph-io/badger/y"
+	"github.com/dgraph-io/badger/v3/y"
+	"github.com/dgraph-io/ristretto/z"
 	"github.com/pkg/errors"
 )
 
@@ -30,7 +31,7 @@ type MergeOperator struct {
 	f      MergeFunc
 	db     *DB
 	key    []byte
-	closer *y.Closer
+	closer *z.Closer
 }
 
 // MergeFunc accepts two byte slices, one representing an existing value, and
@@ -49,7 +50,7 @@ func (db *DB) GetMergeOperator(key []byte,
 		f:      f,
 		db:     db,
 		key:    key,
-		closer: y.NewCloser(1),
+		closer: z.NewCloser(1),
 	}
 
 	go op.runCompactions(dur)
@@ -69,6 +70,9 @@ func (op *MergeOperator) iterateAndMerge() (newVal []byte, latest uint64, err er
 	var numVersions int
 	for it.Rewind(); it.Valid(); it.Next() {
 		item := it.Item()
+		if item.IsDeletedOrExpired() {
+			break
+		}
 		numVersions++
 		if numVersions == 1 {
 			// This should be the newVal, considering this is the latest version.
@@ -112,7 +116,7 @@ func (op *MergeOperator) compact() error {
 		{
 			Key:   y.KeyWithTs(op.key, version),
 			Value: val,
-			meta:  bitDiscardEarlierVersions,
+			meta:  BitDiscardEarlierVersions,
 		},
 	}
 	// Write value back to the DB. It is important that we do not set the bitMergeEntry bit

@@ -1,7 +1,8 @@
 #!/bin/bash
 
-# You might need to go get -v github.com/gogo/protobuf/...
+# Run this script from its directory, so that badgerpb2.proto is where it's expected to
+# be.
 
-protos=${GOPATH-$HOME/go}/src/github.com/dgraph-io/badger/pb
-pushd $protos > /dev/null
-protoc --gofast_out=plugins=grpc:. -I=. pb.proto
+# You might need to go get -v github.com/gogo/protobuf/...
+go get -v github.com/gogo/protobuf/protoc-gen-gogofaster
+protoc --gogofaster_out=. --gogofaster_opt=paths=source_relative -I=. badgerpb3.proto

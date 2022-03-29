@@ -28,14 +28,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dgraph-io/badger/pb"
+	"github.com/dgraph-io/badger/v3/pb"
 	"github.com/stretchr/testify/require"
 )
 
 func TestBackupRestore1(t *testing.T) {
 	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
-	defer os.RemoveAll(dir)
+	defer removeDir(dir)
 	db, err := Open(getTestOptions(dir))
 	require.NoError(t, err)
 
@@ -73,7 +73,7 @@ func TestBackupRestore1(t *testing.T) {
 	// Use different directory.
 	dir, err = ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
-	defer os.RemoveAll(dir)
+	defer removeDir(dir)
 	bak, err := ioutil.TempFile(dir, "badgerbak")
 	require.NoError(t, err)
 	_, err = db.Backup(bak, 0)
@@ -102,6 +102,7 @@ func TestBackupRestore1(t *testing.T) {
 			if err != nil {
 				return err
 			}
+			t.Logf("Got entry: %v\n", item.Version())
 			require.Equal(t, entries[count].key, item.Key())
 			require.Equal(t, entries[count].val, val)
 			require.Equal(t, entries[count].version, item.Version())
@@ -112,25 +113,23 @@ func TestBackupRestore1(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, err)
+	require.Equal(t, 3, int(db.orc.nextTs()))
 }
 
 func TestBackupRestore2(t *testing.T) {
 	tmpdir, err := ioutil.TempDir("", "badger-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		os.RemoveAll(tmpdir)
-	}()
+	require.NoError(t, err)
+
+	defer removeDir(tmpdir)
 
 	s1Path := filepath.Join(tmpdir, "test1")
 	s2Path := filepath.Join(tmpdir, "test2")
 	s3Path := filepath.Join(tmpdir, "test3")
 
-	db1, err := Open(DefaultOptions(s1Path))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db1, err := Open(getTestOptions(s1Path))
+	require.NoError(t, err)
+
+	defer db1.Close()
 	key1 := []byte("key1")
 	key2 := []byte("key2")
 	rawValue := []byte("NotLongValue")
@@ -141,9 +140,8 @@ func TestBackupRestore2(t *testing.T) {
 		}
 		return tx.SetEntry(NewEntry(key2, rawValue))
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
+
 	for i := byte(1); i < N; i++ {
 		err = db1.Update(func(tx *Txn) error {
 			if err := tx.SetEntry(NewEntry(append(key1, i), rawValue)); err != nil {
@@ -151,25 +149,24 @@ func TestBackupRestore2(t *testing.T) {
 			}
 			return tx.SetEntry(NewEntry(append(key2, i), rawValue))
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
+
 	}
 	var backup bytes.Buffer
 	_, err = db1.Backup(&backup, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
+
 	fmt.Println("backup1 length:", backup.Len())
 
-	db2, err := Open(DefaultOptions(s2Path))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db2, err := Open(getTestOptions(s2Path))
+	require.NoError(t, err)
+
+	defer db2.Close()
 	err = db2.Load(&backup, 16)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
+
+	// Check nextTs is correctly set.
+	require.Equal(t, db1.orc.nextTs(), db2.orc.nextTs())
 
 	for i := byte(1); i < N; i++ {
 		err = db2.View(func(tx *Txn) error {
@@ -190,9 +187,8 @@ func TestBackupRestore2(t *testing.T) {
 			}
 			return nil
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
+
 	}
 
 	for i := byte(1); i < N; i++ {
@@ -202,26 +198,25 @@ func TestBackupRestore2(t *testing.T) {
 			}
 			return tx.SetEntry(NewEntry(append(key2, i), rawValue))
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
+
 	}
 
 	backup.Reset()
 	_, err = db2.Backup(&backup, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
+
 	fmt.Println("backup2 length:", backup.Len())
-	db3, err := Open(DefaultOptions(s3Path))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db3, err := Open(getTestOptions(s3Path))
+	require.NoError(t, err)
+
+	defer db3.Close()
 
 	err = db3.Load(&backup, 16)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
+
+	// Check nextTs is correctly set.
+	require.Equal(t, db2.orc.nextTs(), db3.orc.nextTs())
 
 	for i := byte(1); i < N; i++ {
 		err = db3.View(func(tx *Txn) error {
@@ -242,9 +237,8 @@ func TestBackupRestore2(t *testing.T) {
 			}
 			return nil
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
+
 	}
 
 }
@@ -278,73 +272,80 @@ func populateEntries(db *DB, entries []*pb.KV) error {
 }
 
 func TestBackup(t *testing.T) {
-	var bb bytes.Buffer
+	test := func(t *testing.T, db *DB) {
+		var bb bytes.Buffer
+		N := 1000
+		entries := createEntries(N)
+		require.NoError(t, populateEntries(db, entries))
 
-	tmpdir, err := ioutil.TempDir("", "badger-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpdir)
+		_, err := db.Backup(&bb, 0)
+		require.NoError(t, err)
 
-	db1, err := Open(DefaultOptions(filepath.Join(tmpdir, "backup0")))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	N := 1000
-	entries := createEntries(N)
-	require.NoError(t, populateEntries(db1, entries))
-
-	_, err = db1.Backup(&bb, 0)
-	require.NoError(t, err)
-
-	err = db1.View(func(txn *Txn) error {
-		opts := DefaultIteratorOptions
-		it := txn.NewIterator(opts)
-		defer it.Close()
-		var count int
-		for it.Rewind(); it.Valid(); it.Next() {
-			item := it.Item()
-			idx, err := strconv.Atoi(string(item.Key())[3:])
-			if err != nil {
-				return err
+		err = db.View(func(txn *Txn) error {
+			opts := DefaultIteratorOptions
+			it := txn.NewIterator(opts)
+			defer it.Close()
+			var count int
+			for it.Rewind(); it.Valid(); it.Next() {
+				item := it.Item()
+				idx, err := strconv.Atoi(string(item.Key())[3:])
+				if err != nil {
+					return err
+				}
+				if idx > N || !bytes.Equal(entries[idx].Key, item.Key()) {
+					return fmt.Errorf("%s: %s", string(item.Key()), ErrKeyNotFound)
+				}
+				count++
 			}
-			if idx > N || !bytes.Equal(entries[idx].Key, item.Key()) {
-				return fmt.Errorf("%s: %s", string(item.Key()), ErrKeyNotFound)
+			if N != count {
+				return fmt.Errorf("wrong number of items: %d expected, %d actual", N, count)
 			}
-			count++
-		}
-		if N != count {
-			return fmt.Errorf("wrong number of items: %d expected, %d actual", N, count)
-		}
-		return nil
+			return nil
+		})
+		require.NoError(t, err)
+	}
+	t.Run("disk mode", func(t *testing.T) {
+		tmpdir, err := ioutil.TempDir("", "badger-test")
+		require.NoError(t, err)
+
+		defer removeDir(tmpdir)
+		opt := DefaultOptions(filepath.Join(tmpdir, "backup0"))
+		runBadgerTest(t, &opt, func(t *testing.T, db *DB) {
+			test(t, db)
+		})
 	})
-	require.NoError(t, err)
+	t.Run("InMemory mode", func(t *testing.T) {
+		opt := DefaultOptions("")
+		opt.InMemory = true
+		runBadgerTest(t, &opt, func(t *testing.T, db *DB) {
+			test(t, db)
+		})
+	})
 }
 
 func TestBackupRestore3(t *testing.T) {
 	var bb bytes.Buffer
-
 	tmpdir, err := ioutil.TempDir("", "badger-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpdir)
+	require.NoError(t, err)
+
+	defer removeDir(tmpdir)
 
 	N := 1000
 	entries := createEntries(N)
 
+	var db1NextTs uint64
 	// backup
 	{
 		db1, err := Open(DefaultOptions(filepath.Join(tmpdir, "backup1")))
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
 
+		defer db1.Close()
 		require.NoError(t, populateEntries(db1, entries))
 
 		_, err = db1.Backup(&bb, 0)
 		require.NoError(t, err)
+
+		db1NextTs = db1.orc.nextTs()
 		require.NoError(t, db1.Close())
 	}
 	require.True(t, len(entries) == N)
@@ -352,10 +353,12 @@ func TestBackupRestore3(t *testing.T) {
 
 	// restore
 	db2, err := Open(DefaultOptions(filepath.Join(tmpdir, "restore1")))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
+
+	defer db2.Close()
+	require.NotEqual(t, db1NextTs, db2.orc.nextTs())
 	require.NoError(t, db2.Load(&bb, 16))
+	require.Equal(t, db1NextTs, db2.orc.nextTs())
 
 	// verify
 	err = db2.View(func(txn *Txn) error {
@@ -384,22 +387,22 @@ func TestBackupRestore3(t *testing.T) {
 
 func TestBackupLoadIncremental(t *testing.T) {
 	tmpdir, err := ioutil.TempDir("", "badger-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpdir)
+	require.NoError(t, err)
+
+	defer removeDir(tmpdir)
 
 	N := 100
 	entries := createEntries(N)
 	updates := make(map[int]byte)
 	var bb bytes.Buffer
 
+	var db1NextTs uint64
 	// backup
 	{
 		db1, err := Open(DefaultOptions(filepath.Join(tmpdir, "backup2")))
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
+
+		defer db1.Close()
 
 		require.NoError(t, populateEntries(db1, entries))
 		since, err := db1.Backup(&bb, 0)
@@ -443,24 +446,30 @@ func TestBackupLoadIncremental(t *testing.T) {
 				if err := txn.SetEntry(entry); err != nil {
 					return err
 				}
-				updates[i] = bitDiscardEarlierVersions
+				updates[i] = BitDiscardEarlierVersions
 			}
 			return nil
 		})
 		require.NoError(t, err)
 		_, err = db1.Backup(&bb, since)
 		require.NoError(t, err)
+
+		db1NextTs = db1.orc.nextTs()
+
 		require.NoError(t, db1.Close())
 	}
 	require.True(t, len(entries) == N)
 	require.True(t, bb.Len() > 0)
 
 	// restore
-	db2, err := Open(DefaultOptions(filepath.Join(tmpdir, "restore2")))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db2, err := Open(getTestOptions(filepath.Join(tmpdir, "restore2")))
+	require.NoError(t, err)
+
+	defer db2.Close()
+
+	require.NotEqual(t, db1NextTs, db2.orc.nextTs())
 	require.NoError(t, db2.Load(&bb, 16))
+	require.Equal(t, db1NextTs, db2.orc.nextTs())
 
 	// verify
 	actual := make(map[int]byte)
@@ -494,4 +503,63 @@ func TestBackupLoadIncremental(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, err, "%v %v", updates, actual)
+}
+
+func TestBackupBitClear(t *testing.T) {
+	dir, err := ioutil.TempDir("", "badger-test")
+	require.NoError(t, err)
+	defer removeDir(dir)
+
+	opt := getTestOptions(dir)
+	opt.ValueThreshold = 10 // This is important
+	db, err := Open(opt)
+	require.NoError(t, err)
+
+	key := []byte("foo")
+	val := []byte(fmt.Sprintf("%0100d", 1))
+	require.Greater(t, int64(len(val)), db.valueThreshold())
+
+	err = db.Update(func(txn *Txn) error {
+		e := NewEntry(key, val)
+		// Value > valueTheshold so bitValuePointer will be set.
+		return txn.SetEntry(e)
+	})
+	require.NoError(t, err)
+
+	// Use different directory.
+	dir, err = ioutil.TempDir("", "badger-test")
+	require.NoError(t, err)
+	defer removeDir(dir)
+
+	bak, err := ioutil.TempFile(dir, "badgerbak")
+	require.NoError(t, err)
+	_, err = db.Backup(bak, 0)
+	require.NoError(t, err)
+	require.NoError(t, bak.Close())
+
+	oldValue := db.orc.nextTs()
+	require.NoError(t, db.Close())
+
+	opt = getTestOptions(dir)
+	opt.ValueThreshold = 200 // This is important.
+	db, err = Open(opt)
+	require.NoError(t, err)
+	defer db.Close()
+
+	bak, err = os.Open(bak.Name())
+	require.NoError(t, err)
+	defer bak.Close()
+
+	require.NoError(t, db.Load(bak, 16))
+	// Ensure nextTs is still the same.
+	require.Equal(t, oldValue, db.orc.nextTs())
+
+	require.NoError(t, db.View(func(txn *Txn) error {
+		e, err := txn.Get(key)
+		require.NoError(t, err)
+		v, err := e.ValueCopy(nil)
+		require.NoError(t, err)
+		require.Equal(t, val, v)
+		return nil
+	}))
 }

@@ -20,7 +20,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/dgraph-io/badger/y"
+	"github.com/dgraph-io/badger/v3/y"
 )
 
 const (
@@ -35,8 +35,9 @@ const (
 
 // Arena should be lock-free.
 type Arena struct {
-	n   uint32
-	buf []byte
+	n          uint32
+	shouldGrow bool
+	buf        []byte
 }
 
 // newArena returns a new arena.
@@ -50,12 +51,35 @@ func newArena(n int64) *Arena {
 	return out
 }
 
-func (s *Arena) size() int64 {
-	return int64(atomic.LoadUint32(&s.n))
+func (s *Arena) allocate(sz uint32) uint32 {
+	offset := atomic.AddUint32(&s.n, sz)
+	if !s.shouldGrow {
+		y.AssertTrue(int(offset) <= len(s.buf))
+		return offset - sz
+	}
+
+	// We are keeping extra bytes in the end so that the checkptr doesn't fail. We apply some
+	// intelligence to reduce the size of the node by only keeping towers upto valid height and not
+	// maxHeight. This reduces the node's size, but checkptr doesn't know about its reduced size.
+	// checkptr tries to verify that the node of size MaxNodeSize resides on a single heap
+	// allocation which causes this error: checkptr:converted pointer straddles multiple allocations
+	if int(offset) > len(s.buf)-MaxNodeSize {
+		growBy := uint32(len(s.buf))
+		if growBy > 1<<30 {
+			growBy = 1 << 30
+		}
+		if growBy < sz {
+			growBy = sz
+		}
+		newBuf := make([]byte, len(s.buf)+int(growBy))
+		y.AssertTrue(len(s.buf) == copy(newBuf, s.buf))
+		s.buf = newBuf
+	}
+	return offset - sz
 }
 
-func (s *Arena) reset() {
-	atomic.StoreUint32(&s.n, 0)
+func (s *Arena) size() int64 {
+	return int64(atomic.LoadUint32(&s.n))
 }
 
 // putNode allocates a node in the arena. The node is aligned on a pointer-sized
@@ -67,13 +91,10 @@ func (s *Arena) putNode(height int) uint32 {
 
 	// Pad the allocation with enough bytes to ensure pointer alignment.
 	l := uint32(MaxNodeSize - unusedSize + nodeAlign)
-	n := atomic.AddUint32(&s.n, l)
-	y.AssertTruef(int(n) <= len(s.buf),
-		"Arena too small, toWrite:%d newTotal:%d limit:%d",
-		l, n, len(s.buf))
+	n := s.allocate(l)
 
 	// Return the aligned offset.
-	m := (n - l + uint32(nodeAlign)) & ^uint32(nodeAlign)
+	m := (n + uint32(nodeAlign)) & ^uint32(nodeAlign)
 	return m
 }
 
@@ -83,24 +104,17 @@ func (s *Arena) putNode(height int) uint32 {
 // decoding will incur some overhead.
 func (s *Arena) putVal(v y.ValueStruct) uint32 {
 	l := uint32(v.EncodedSize())
-	n := atomic.AddUint32(&s.n, l)
-	y.AssertTruef(int(n) <= len(s.buf),
-		"Arena too small, toWrite:%d newTotal:%d limit:%d",
-		l, n, len(s.buf))
-	m := n - l
-	v.Encode(s.buf[m:])
-	return m
+	offset := s.allocate(l)
+	v.Encode(s.buf[offset:])
+	return offset
 }
 
 func (s *Arena) putKey(key []byte) uint32 {
-	l := uint32(len(key))
-	n := atomic.AddUint32(&s.n, l)
-	y.AssertTruef(int(n) <= len(s.buf),
-		"Arena too small, toWrite:%d newTotal:%d limit:%d",
-		l, n, len(s.buf))
-	m := n - l
-	y.AssertTrue(len(key) == copy(s.buf[m:n], key))
-	return m
+	keySz := uint32(len(key))
+	offset := s.allocate(keySz)
+	buf := s.buf[offset : offset+keySz]
+	y.AssertTrue(len(key) == copy(buf, key))
+	return offset
 }
 
 // getNode returns a pointer to the node located at offset. If the offset is
@@ -109,7 +123,6 @@ func (s *Arena) getNode(offset uint32) *node {
 	if offset == 0 {
 		return nil
 	}
-
 	return (*node)(unsafe.Pointer(&s.buf[offset]))
 }
 

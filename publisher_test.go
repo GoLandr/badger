@@ -18,13 +18,73 @@ package badger
 import (
 	"context"
 	"fmt"
+	"github.com/pkg/errors"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/dgraph-io/badger/pb"
+	"github.com/dgraph-io/badger/v3/pb"
 )
+
+// This test will result in deadlock for commits before this.
+// Exiting this test gracefully will be the proof that the
+// publisher is no longer stuck in deadlock.
+func TestPublisherDeadlock(t *testing.T) {
+	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+		var subWg sync.WaitGroup
+		subWg.Add(1)
+
+		var firstUpdate sync.WaitGroup
+		firstUpdate.Add(1)
+
+
+		var subDone sync.WaitGroup
+		subDone.Add(1)
+		go func() {
+			subWg.Done()
+			match := pb.Match{Prefix: []byte("ke"), IgnoreBytes: ""}
+			err := db.Subscribe(context.Background(), func(kvs *pb.KVList) error {
+				firstUpdate.Done()
+				time.Sleep(time.Second * 20)
+				return errors.New("error returned")
+			}, []pb.Match{match})
+			require.Error(t, err, errors.New("error returned"))
+			subDone.Done()
+		}()
+		subWg.Wait()
+		go func() {
+			err := db.Update(func(txn *Txn) error {
+				e := NewEntry([]byte(fmt.Sprintf("key%d", 0)), []byte(fmt.Sprintf("value%d", 0)))
+				return txn.SetEntry(e)
+			})
+			require.NoError(t, err)
+		} ()
+
+		firstUpdate.Wait()
+		req := int64(0)
+		for i := 1; i < 1110; i++ {
+			time.Sleep(time.Millisecond * 10)
+			go func(i int) {
+				err := db.Update(func(txn *Txn) error {
+					e := NewEntry([]byte(fmt.Sprintf("key%d", i)), []byte(fmt.Sprintf("value%d", i)))
+					return txn.SetEntry(e)
+				})
+				require.NoError(t, err)
+				atomic.AddInt64(&req, 1)
+			}(i)
+		}
+		for {
+			if atomic.LoadInt64(&req) == 1109 {
+				break
+			}
+			time.Sleep(time.Second)
+		}
+		subDone.Wait()
+	})
+}
 
 func TestPublisherOrdering(t *testing.T) {
 	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
@@ -36,7 +96,8 @@ func TestPublisherOrdering(t *testing.T) {
 		go func() {
 			subWg.Done()
 			updates := 0
-			err := db.Subscribe(context.Background(), func(kvs *pb.KVList) {
+			match := pb.Match{Prefix: []byte("ke"), IgnoreBytes: ""}
+			err := db.Subscribe(context.Background(), func(kvs *pb.KVList) error {
 				updates += len(kvs.GetKv())
 				for _, kv := range kvs.GetKv() {
 					order = append(order, string(kv.Value))
@@ -44,7 +105,8 @@ func TestPublisherOrdering(t *testing.T) {
 				if updates == 5 {
 					wg.Done()
 				}
-			}, []byte("ke"))
+				return nil
+			}, []pb.Match{match})
 			if err != nil {
 				require.Equal(t, err.Error(), context.Canceled.Error())
 			}
@@ -72,7 +134,9 @@ func TestMultiplePrefix(t *testing.T) {
 		go func() {
 			subWg.Done()
 			updates := 0
-			err := db.Subscribe(context.Background(), func(kvs *pb.KVList) {
+			match1 := pb.Match{Prefix: []byte("ke"), IgnoreBytes: ""}
+			match2 := pb.Match{Prefix: []byte("hel"), IgnoreBytes: ""}
+			err := db.Subscribe(context.Background(), func(kvs *pb.KVList) error {
 				updates += len(kvs.GetKv())
 				for _, kv := range kvs.GetKv() {
 					if string(kv.Key) == "key" {
@@ -84,7 +148,8 @@ func TestMultiplePrefix(t *testing.T) {
 				if updates == 2 {
 					wg.Done()
 				}
-			}, []byte("ke"), []byte("hel"))
+				return nil
+			}, []pb.Match{match1, match2})
 			if err != nil {
 				require.Equal(t, err.Error(), context.Canceled.Error())
 			}

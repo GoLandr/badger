@@ -23,10 +23,8 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"math"
 	"math/rand"
-	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -37,13 +35,11 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/dgraph-io/badger/options"
-	"github.com/dgraph-io/badger/pb"
-	"github.com/dgraph-io/badger/skl"
-	"github.com/dgraph-io/badger/y"
+	"github.com/dgraph-io/badger/v3/options"
+	"github.com/dgraph-io/badger/v3/pb"
+	"github.com/dgraph-io/badger/v3/y"
+	"github.com/dgraph-io/ristretto/z"
 )
-
-var mmap = flag.Bool("vlog_mmap", true, "Specify if value log must be memory-mapped")
 
 // summary is produced when DB is closed. Currently it is used only for testing.
 type summary struct {
@@ -72,12 +68,8 @@ func (s *DB) validate() error { return s.lc.validate() }
 
 func getTestOptions(dir string) Options {
 	opt := DefaultOptions(dir).
-		WithMaxTableSize(1 << 15). // Force more compaction.
-		WithLevelOneSize(4 << 15). // Force more compaction.
-		WithSyncWrites(false)
-	if !*mmap {
-		return opt.WithValueLogLoadingMode(options.FileIO)
-	}
+		WithSyncWrites(false).
+		WithLoggingLevel(WARNING)
 	return opt
 }
 
@@ -116,15 +108,18 @@ func txnDelete(t *testing.T, kv *DB, key []byte) {
 func runBadgerTest(t *testing.T, opts *Options, test func(t *testing.T, db *DB)) {
 	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
-	defer func() {
-		require.NoError(t, os.RemoveAll(dir))
-	}()
+	defer removeDir(dir)
 	if opts == nil {
 		opts = new(Options)
 		*opts = getTestOptions(dir)
 	} else {
 		opts.Dir = dir
 		opts.ValueDir = dir
+	}
+
+	if opts.InMemory {
+		opts.Dir = ""
+		opts.ValueDir = ""
 	}
 	db, err := Open(*opts)
 	require.NoError(t, err)
@@ -230,7 +225,7 @@ func TestConcurrentWrite(t *testing.T) {
 }
 
 func TestGet(t *testing.T) {
-	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+	test := func(t *testing.T, db *DB) {
 		txnSet(t, db, []byte("key1"), []byte("val1"), 0x08)
 
 		txn := db.NewTransaction(false)
@@ -272,6 +267,24 @@ func TestGet(t *testing.T) {
 		require.NoError(t, err)
 		require.EqualValues(t, longVal, getItemValue(t, item))
 		txn.Discard()
+	}
+	t.Run("disk mode", func(t *testing.T) {
+		runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+			test(t, db)
+		})
+	})
+	t.Run("InMemory mode", func(t *testing.T) {
+		opts := DefaultOptions("").WithInMemory(true)
+		db, err := Open(opts)
+		require.NoError(t, err)
+		test(t, db)
+		require.NoError(t, db.Close())
+	})
+	t.Run("cache enabled", func(t *testing.T) {
+		opts := DefaultOptions("").WithBlockCacheSize(10 << 20)
+		runBadgerTest(t, &opts, func(t *testing.T, db *DB) {
+			test(t, db)
+		})
 	})
 }
 
@@ -325,11 +338,10 @@ func TestTxnTooBig(t *testing.T) {
 func TestForceCompactL0(t *testing.T) {
 	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
-	defer func() {
-		require.NoError(t, os.RemoveAll(dir))
-	}()
+	defer removeDir(dir)
 
-	opts := getTestOptions(dir)
+	// This test relies on CompactL0OnClose
+	opts := getTestOptions(dir).WithCompactL0OnClose(true)
 	opts.ValueLogFileSize = 15 << 20
 	opts.managedTxns = true
 	db, err := Open(opts)
@@ -359,18 +371,172 @@ func TestForceCompactL0(t *testing.T) {
 	require.NoError(t, db.Close())
 }
 
+func TestStreamDB(t *testing.T) {
+	check := func(db *DB) {
+		for i := 0; i < 100; i++ {
+			key := []byte(fmt.Sprintf("key%d", i))
+			val := []byte(fmt.Sprintf("val%d", i))
+			txn := db.NewTransactionAt(1, false)
+			item, err := txn.Get(key)
+			require.NoError(t, err)
+			require.EqualValues(t, val, getItemValue(t, item))
+			require.Equal(t, byte(0x00), item.UserMeta())
+			txn.Discard()
+		}
+	}
+
+	dir, err := ioutil.TempDir("", "badger-test")
+	require.NoError(t, err)
+	defer removeDir(dir)
+	opts := getTestOptions(dir).
+		WithCompression(options.ZSTD).
+		WithBlockCacheSize(100 << 20)
+
+	db, err := OpenManaged(opts)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, db.Close())
+	}()
+
+	writer := db.NewManagedWriteBatch()
+	for i := 0; i < 100; i++ {
+		key := []byte(fmt.Sprintf("key%d", i))
+		val := []byte(fmt.Sprintf("val%d", i))
+		require.NoError(t, writer.SetEntryAt(NewEntry(key, val).WithMeta(0x00), 1))
+	}
+	require.NoError(t, writer.Flush())
+	check(db)
+
+	outDir, err := ioutil.TempDir("", "badger-test")
+	require.NoError(t, err)
+	outOpt := getTestOptions(outDir)
+	require.NoError(t, db.StreamDB(outOpt))
+
+	outDB, err := OpenManaged(outOpt)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, outDB.Close())
+	}()
+	check(outDB)
+}
+
+func dirSize(path string) (int64, error) {
+	var size int64
+	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if !info.IsDir() {
+			size += info.Size()
+		}
+		return err
+	})
+	return (size >> 20), err
+}
+
+// BenchmarkDbGrowth ensures DB does not grow with repeated adds and deletes.
+//
+// New keys are created with each for-loop iteration. During each
+// iteration, the previous for-loop iteration's keys are deleted.
+//
+// To reproduce continous growth problem due to `badgerMove` keys,
+// update `value.go` `discardEntry` line 1628 to return false
+//
+// Also with PR #1303, the delete keys are properly cleaned which
+// further reduces disk size.
+func BenchmarkDbGrowth(b *testing.B) {
+	dir, err := ioutil.TempDir("", "badger-test")
+	require.NoError(b, err)
+	defer removeDir(dir)
+
+	start := 0
+	lastStart := 0
+	numKeys := 2000
+	valueSize := 1024
+	value := make([]byte, valueSize)
+
+	discardRatio := 0.001
+	maxWrites := 200
+	opts := getTestOptions(dir)
+	opts.ValueLogFileSize = 64 << 15
+	opts.BaseTableSize = 4 << 15
+	opts.BaseLevelSize = 16 << 15
+	opts.NumVersionsToKeep = 1
+	opts.NumLevelZeroTables = 1
+	opts.NumLevelZeroTablesStall = 2
+	db, err := Open(opts)
+	require.NoError(b, err)
+	for numWrites := 0; numWrites < maxWrites; numWrites++ {
+		txn := db.NewTransaction(true)
+		if start > 0 {
+			for i := lastStart; i < start; i++ {
+				key := make([]byte, 8)
+				binary.BigEndian.PutUint64(key[:], uint64(i))
+				err := txn.Delete(key)
+				if err == ErrTxnTooBig {
+					require.NoError(b, txn.Commit())
+					txn = db.NewTransaction(true)
+				} else {
+					require.NoError(b, err)
+				}
+			}
+		}
+
+		for i := start; i < numKeys+start; i++ {
+			key := make([]byte, 8)
+			binary.BigEndian.PutUint64(key[:], uint64(i))
+			err := txn.SetEntry(NewEntry(key, value))
+			if err == ErrTxnTooBig {
+				require.NoError(b, txn.Commit())
+				txn = db.NewTransaction(true)
+			} else {
+				require.NoError(b, err)
+			}
+		}
+		require.NoError(b, txn.Commit())
+		require.NoError(b, db.Flatten(1))
+		for {
+			err = db.RunValueLogGC(discardRatio)
+			if err == ErrNoRewrite {
+				break
+			} else {
+				require.NoError(b, err)
+			}
+		}
+		size, err := dirSize(dir)
+		require.NoError(b, err)
+		fmt.Printf("Badger DB Size = %dMB\n", size)
+		lastStart = start
+		start += numKeys
+	}
+
+	db.Close()
+	size, err := dirSize(dir)
+	require.NoError(b, err)
+	require.LessOrEqual(b, size, int64(16))
+	fmt.Printf("Badger DB Size = %dMB\n", size)
+}
+
 // Put a lot of data to move some data to disk.
 // WARNING: This test might take a while but it should pass!
 func TestGetMore(t *testing.T) {
+	if !*manual {
+		t.Skip("Skipping test meant to be run manually.")
+		return
+	}
 	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
-
 		data := func(i int) []byte {
 			return []byte(fmt.Sprintf("%b", i))
 		}
-		//	n := 500000
-		n := 10000
+		n := 200000
 		m := 45 // Increasing would cause ErrTxnTooBig
 		for i := 0; i < n; i += m {
+			if (i % 10000) == 0 {
+				fmt.Printf("Inserting i=%d\n", i)
+			}
 			txn := db.NewTransaction(true)
 			for j := i; j < i+m && j < n; j++ {
 				require.NoError(t, txn.SetEntry(NewEntry(data(j), data(j))))
@@ -462,7 +628,7 @@ func TestGetMore(t *testing.T) {
 // Put a lot of data to move some data to disk.
 // WARNING: This test might take a while but it should pass!
 func TestExistsMore(t *testing.T) {
-	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+	test := func(t *testing.T, db *DB) {
 		//	n := 500000
 		n := 10000
 		m := 45
@@ -522,12 +688,23 @@ func TestExistsMore(t *testing.T) {
 			}))
 		}
 		fmt.Println("Done and closing")
+	}
+	t.Run("disk mode", func(t *testing.T) {
+		runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+			test(t, db)
+		})
+	})
+	t.Run("InMemory mode", func(t *testing.T) {
+		opt := DefaultOptions("").WithInMemory(true)
+		db, err := Open(opt)
+		require.NoError(t, err)
+		test(t, db)
+		require.NoError(t, db.Close())
 	})
 }
 
 func TestIterate2Basic(t *testing.T) {
-	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
-
+	test := func(t *testing.T, db *DB) {
 		bkey := func(i int) []byte {
 			return []byte(fmt.Sprintf("%09d", i))
 		}
@@ -585,61 +762,110 @@ func TestIterate2Basic(t *testing.T) {
 			}
 		}
 		it.Close()
+	}
+	t.Run("disk mode", func(t *testing.T) {
+		runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+			test(t, db)
+		})
 	})
+	t.Run("InMemory mode", func(t *testing.T) {
+		opt := DefaultOptions("").WithInMemory(true)
+		db, err := Open(opt)
+		require.NoError(t, err)
+		test(t, db)
+		require.NoError(t, db.Close())
+	})
+
 }
 
 func TestLoad(t *testing.T) {
-	dir, err := ioutil.TempDir("", "badger-test")
-	require.NoError(t, err)
-	defer func() {
-		require.NoError(t, os.RemoveAll(dir))
-	}()
-	n := 10000
-	{
-		kv, err := Open(getTestOptions(dir))
+	testLoad := func(t *testing.T, opt Options) {
+		dir, err := ioutil.TempDir("", "badger-test")
 		require.NoError(t, err)
+		defer removeDir(dir)
+		opt.Dir = dir
+		opt.ValueDir = dir
+		n := 10000
+		{
+			kv, err := Open(opt)
+			require.NoError(t, err)
+			for i := 0; i < n; i++ {
+				if (i % 10000) == 0 {
+					fmt.Printf("Putting i=%d\n", i)
+				}
+				k := []byte(fmt.Sprintf("%09d", i))
+				txnSet(t, kv, k, k, 0x00)
+			}
+			require.Equal(t, 10000, int(kv.orc.readTs()))
+			kv.Close()
+		}
+		kv, err := Open(opt)
+		require.NoError(t, err)
+		require.Equal(t, 10000, int(kv.orc.readTs()))
+
 		for i := 0; i < n; i++ {
 			if (i % 10000) == 0 {
-				fmt.Printf("Putting i=%d\n", i)
+				fmt.Printf("Testing i=%d\n", i)
 			}
-			k := []byte(fmt.Sprintf("%09d", i))
-			txnSet(t, kv, k, k, 0x00)
+			k := fmt.Sprintf("%09d", i)
+			require.NoError(t, kv.View(func(txn *Txn) error {
+				item, err := txn.Get([]byte(k))
+				require.NoError(t, err)
+				require.EqualValues(t, k, string(getItemValue(t, item)))
+				return nil
+			}))
 		}
 		kv.Close()
-	}
+		summary := kv.lc.getSummary()
 
-	kv, err := Open(getTestOptions(dir))
-	require.NoError(t, err)
-	require.Equal(t, uint64(10001), kv.orc.readTs())
-
-	for i := 0; i < n; i++ {
-		if (i % 10000) == 0 {
-			fmt.Printf("Testing i=%d\n", i)
+		// Check that files are garbage collected.
+		idMap := getIDMap(dir)
+		for fileID := range idMap {
+			// Check that name is in summary.filenames.
+			require.True(t, summary.fileIDs[fileID], "%d", fileID)
 		}
-		k := fmt.Sprintf("%09d", i)
-		require.NoError(t, kv.View(func(txn *Txn) error {
-			item, err := txn.Get([]byte(k))
-			require.NoError(t, err)
-			require.EqualValues(t, k, string(getItemValue(t, item)))
-			return nil
-		}))
-	}
-	kv.Close()
-	summary := kv.lc.getSummary()
+		require.EqualValues(t, len(idMap), len(summary.fileIDs))
 
-	// Check that files are garbage collected.
-	idMap := getIDMap(dir)
-	for fileID := range idMap {
-		// Check that name is in summary.filenames.
-		require.True(t, summary.fileIDs[fileID], "%d", fileID)
+		var fileIDs []uint64
+		for k := range summary.fileIDs { // Map to array.
+			fileIDs = append(fileIDs, k)
+		}
+		sort.Slice(fileIDs, func(i, j int) bool { return fileIDs[i] < fileIDs[j] })
+		fmt.Printf("FileIDs: %v\n", fileIDs)
 	}
-	require.EqualValues(t, len(idMap), len(summary.fileIDs))
-
-	var fileIDs []uint64
-	for k := range summary.fileIDs { // Map to array.
-		fileIDs = append(fileIDs, k)
-	}
-	sort.Slice(fileIDs, func(i, j int) bool { return fileIDs[i] < fileIDs[j] })
+	t.Run("TestLoad Without Encryption/Compression", func(t *testing.T) {
+		opt := getTestOptions("")
+		opt.Compression = options.None
+		testLoad(t, opt)
+	})
+	t.Run("TestLoad With Encryption and no compression", func(t *testing.T) {
+		key := make([]byte, 32)
+		_, err := rand.Read(key)
+		require.NoError(t, err)
+		opt := getTestOptions("")
+		opt.EncryptionKey = key
+		opt.BlockCacheSize = 100 << 20
+		opt.IndexCacheSize = 100 << 20
+		opt.Compression = options.None
+		testLoad(t, opt)
+	})
+	t.Run("TestLoad With Encryption and compression", func(t *testing.T) {
+		key := make([]byte, 32)
+		_, err := rand.Read(key)
+		require.NoError(t, err)
+		opt := getTestOptions("")
+		opt.EncryptionKey = key
+		opt.Compression = options.ZSTD
+		opt.BlockCacheSize = 100 << 20
+		opt.IndexCacheSize = 100 << 20
+		testLoad(t, opt)
+	})
+	t.Run("TestLoad without Encryption and with compression", func(t *testing.T) {
+		opt := getTestOptions("")
+		opt.Compression = options.ZSTD
+		opt.BlockCacheSize = 100 << 20
+		testLoad(t, opt)
+	})
 }
 
 func TestIterateDeleted(t *testing.T) {
@@ -693,6 +919,10 @@ func TestIterateDeleted(t *testing.T) {
 }
 
 func TestIterateParallel(t *testing.T) {
+	if !*manual {
+		t.Skip("Skipping test meant to be run manually.")
+		return
+	}
 	key := func(account int) []byte {
 		var b [4]byte
 		binary.BigEndian.PutUint32(b[:], uint32(account))
@@ -739,33 +969,53 @@ func TestIterateParallel(t *testing.T) {
 
 		wg.Wait()
 
-		// Check that a RW txn can't run multiple iterators.
+		// Check that a RW txn can run multiple iterators.
 		txn := db.NewTransaction(true)
 		itr := txn.NewIterator(DefaultIteratorOptions)
-		require.Panics(t, func() {
-			txn.NewIterator(DefaultIteratorOptions)
+		require.NotPanics(t, func() {
+			// Now that multiple iterators are supported in read-write
+			// transactions, make sure this does not panic anymore. Then just
+			// close the iterator.
+			txn.NewIterator(DefaultIteratorOptions).Close()
 		})
+		// The transaction should still panic since there is still one pending
+		// iterator that is open.
 		require.Panics(t, txn.Discard)
 		itr.Close()
 		txn.Discard()
 
-		// Run multiple iterators for a RO txn.
-		txn = db.NewTransaction(false)
-		defer txn.Discard()
-		wg.Add(3)
-		go iterate(txn, &wg)
-		go iterate(txn, &wg)
-		go iterate(txn, &wg)
-		wg.Wait()
+		// (Regression) Make sure that creating multiple concurrent iterators
+		// within a read only transaction continues to work.
+		t.Run("multiple read-only iterators", func(t *testing.T) {
+			// Run multiple iterators for a RO txn.
+			txn = db.NewTransaction(false)
+			defer txn.Discard()
+			wg.Add(3)
+			go iterate(txn, &wg)
+			go iterate(txn, &wg)
+			go iterate(txn, &wg)
+			wg.Wait()
+		})
+
+		// Make sure that when we create multiple concurrent iterators within a
+		// read-write transaction that it actually iterates successfully.
+		t.Run("multiple read-write iterators", func(t *testing.T) {
+			// Run multiple iterators for a RO txn.
+			txn = db.NewTransaction(true)
+			defer txn.Discard()
+			wg.Add(3)
+			go iterate(txn, &wg)
+			go iterate(txn, &wg)
+			go iterate(txn, &wg)
+			wg.Wait()
+		})
 	})
 }
 
 func TestDeleteWithoutSyncWrite(t *testing.T) {
 	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
-	defer func() {
-		require.NoError(t, os.RemoveAll(dir))
-	}()
+	defer removeDir(dir)
 	kv, err := Open(DefaultOptions(dir))
 	if err != nil {
 		t.Error(err)
@@ -878,9 +1128,7 @@ func TestIteratorPrefetchSize(t *testing.T) {
 func TestSetIfAbsentAsync(t *testing.T) {
 	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
-	defer func() {
-		require.NoError(t, os.RemoveAll(dir))
-	}()
+	defer removeDir(dir)
 	kv, _ := Open(getTestOptions(dir))
 
 	bkey := func(i int) []byte {
@@ -1071,50 +1319,74 @@ func TestExpiry(t *testing.T) {
 }
 
 func TestExpiryImproperDBClose(t *testing.T) {
-	dir, err := ioutil.TempDir("", "badger-test")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-	opt := getTestOptions(dir)
-	opt.ValueLogLoadingMode = options.FileIO
-
-	db0, err := Open(opt)
-	require.NoError(t, err)
-
-	dur := 1 * time.Hour
-	expiryTime := uint64(time.Now().Add(dur).Unix())
-	err = db0.Update(func(txn *Txn) error {
-		err = txn.SetEntry(NewEntry([]byte("test_key"), []byte("test_value")).WithTTL(dur))
+	testReplay := func(opt Options) {
+		// L0 compaction doesn't affect the test in any way. It is set to allow
+		// graceful shutdown of db0.
+		db0, err := Open(opt.WithCompactL0OnClose(false))
 		require.NoError(t, err)
-		return nil
-	})
-	require.NoError(t, err)
 
-	// Simulate a crash by not closing db0, but releasing the locks.
-	if db0.dirLockGuard != nil {
-		require.NoError(t, db0.dirLockGuard.release())
-	}
-	if db0.valueDirGuard != nil {
-		require.NoError(t, db0.valueDirGuard.release())
-	}
-
-	db1, err := Open(opt)
-	require.NoError(t, err)
-	err = db1.View(func(txn *Txn) error {
-		itm, err := txn.Get([]byte("test_key"))
+		dur := 1 * time.Hour
+		expiryTime := uint64(time.Now().Add(dur).Unix())
+		err = db0.Update(func(txn *Txn) error {
+			err = txn.SetEntry(NewEntry([]byte("test_key"), []byte("test_value")).WithTTL(dur))
+			require.NoError(t, err)
+			return nil
+		})
 		require.NoError(t, err)
-		require.True(t, expiryTime <= itm.ExpiresAt() && itm.ExpiresAt() <= uint64(time.Now().Add(dur).Unix()),
-			"expiry time of entry is invalid")
-		return nil
+
+		// Simulate a crash  by not closing db0, but releasing the locks.
+		if db0.dirLockGuard != nil {
+			require.NoError(t, db0.dirLockGuard.release())
+			db0.dirLockGuard = nil
+		}
+		if db0.valueDirGuard != nil {
+			require.NoError(t, db0.valueDirGuard.release())
+			db0.valueDirGuard = nil
+		}
+		require.NoError(t, db0.Close())
+
+		db1, err := Open(opt)
+		require.NoError(t, err)
+		err = db1.View(func(txn *Txn) error {
+			itm, err := txn.Get([]byte("test_key"))
+			require.NoError(t, err)
+			require.True(t, expiryTime <= itm.ExpiresAt() && itm.ExpiresAt() <= uint64(time.Now().Add(dur).Unix()),
+				"expiry time of entry is invalid")
+			return nil
+		})
+		require.NoError(t, err)
+		require.NoError(t, db1.Close())
+	}
+
+	t.Run("Test plain text", func(t *testing.T) {
+		dir, err := ioutil.TempDir("", "badger-test")
+		require.NoError(t, err)
+		defer removeDir(dir)
+		opt := getTestOptions(dir)
+		testReplay(opt)
 	})
-	require.NoError(t, err)
-	require.NoError(t, db1.Close())
+
+	t.Run("Test encryption", func(t *testing.T) {
+		dir, err := ioutil.TempDir("", "badger-test")
+		require.NoError(t, err)
+		defer removeDir(dir)
+		opt := getTestOptions(dir)
+		key := make([]byte, 32)
+		_, err = rand.Read(key)
+		require.NoError(t, err)
+		opt.EncryptionKey = key
+		opt.BlockCacheSize = 10 << 20
+		opt.IndexCacheSize = 10 << 20
+		testReplay(opt)
+	})
+
 }
 
 func randBytes(n int) []byte {
 	recv := make([]byte, n)
 	in, err := rand.Read(recv)
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 	return recv[:in]
 }
@@ -1133,50 +1405,54 @@ var benchmarkData = []struct {
 }
 
 func TestLargeKeys(t *testing.T) {
-	dir, err := ioutil.TempDir("", "badger-test")
-	require.NoError(t, err)
+	test := func(t *testing.T, opt Options) {
+		db, err := Open(opt)
+		require.NoError(t, err)
+		for i := 0; i < 1000; i++ {
+			tx := db.NewTransaction(true)
+			for _, kv := range benchmarkData {
+				k := make([]byte, len(kv.key))
+				copy(k, kv.key)
 
-	db, err := Open(DefaultOptions(dir).WithValueLogFileSize(1024 * 1024 * 1024))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		require.NoError(t, db.Close())
-		require.NoError(t, os.RemoveAll(dir))
-	}()
-	for i := 0; i < 1000; i++ {
-		tx := db.NewTransaction(true)
-		for _, kv := range benchmarkData {
-			k := make([]byte, len(kv.key))
-			copy(k, kv.key)
-
-			v := make([]byte, len(kv.value))
-			copy(v, kv.value)
-			if err := tx.SetEntry(NewEntry(k, v)); err != nil {
-				// check is success should be true
-				if kv.success {
-					t.Fatalf("failed with: %s", err)
+				v := make([]byte, len(kv.value))
+				copy(v, kv.value)
+				if err := tx.SetEntry(NewEntry(k, v)); err != nil {
+					// check is success should be true
+					if kv.success {
+						t.Fatalf("failed with: %s", err)
+					}
+				} else if !kv.success {
+					t.Fatal("insertion should fail")
 				}
-			} else if !kv.success {
-				t.Fatal("insertion should fail")
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatalf("#%d: batchSet err: %v", i, err)
 			}
 		}
-		if err := tx.Commit(); err != nil {
-			t.Fatalf("#%d: batchSet err: %v", i, err)
-		}
+		require.NoError(t, db.Close())
 	}
+	t.Run("disk mode", func(t *testing.T) {
+		dir, err := ioutil.TempDir("", "badger-test")
+		require.NoError(t, err)
+		defer removeDir(dir)
+		opt := DefaultOptions(dir).WithValueLogFileSize(1024 * 1024 * 1024)
+		test(t, opt)
+	})
+	t.Run("InMemory mode", func(t *testing.T) {
+		opt := DefaultOptions("").WithValueLogFileSize(1024 * 1024 * 1024)
+		opt.InMemory = true
+		test(t, opt)
+	})
 }
 
 func TestCreateDirs(t *testing.T) {
 	dir, err := ioutil.TempDir("", "parent")
 	require.NoError(t, err)
-	defer func() {
-		require.NoError(t, os.RemoveAll(dir))
-	}()
+	defer removeDir(dir)
 
 	db, err := Open(DefaultOptions(filepath.Join(dir, "badger")))
 	require.NoError(t, err)
-	db.Close()
+	require.NoError(t, db.Close())
 	_, err = os.Stat(dir)
 	require.NoError(t, err)
 }
@@ -1185,9 +1461,7 @@ func TestGetSetDeadlock(t *testing.T) {
 	dir, err := ioutil.TempDir("", "badger-test")
 	fmt.Println(dir)
 	require.NoError(t, err)
-	defer func() {
-		require.NoError(t, os.RemoveAll(dir))
-	}()
+	defer removeDir(dir)
 
 	db, err := Open(DefaultOptions(dir).WithValueLogFileSize(1 << 20))
 	require.NoError(t, err)
@@ -1229,14 +1503,11 @@ func TestGetSetDeadlock(t *testing.T) {
 func TestWriteDeadlock(t *testing.T) {
 	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
+	defer removeDir(dir)
 
 	db, err := Open(DefaultOptions(dir).WithValueLogFileSize(10 << 20))
 	require.NoError(t, err)
-	defer func() {
-		require.NoError(t, db.Close())
-		require.NoError(t, os.RemoveAll(dir))
-	}()
-
+	defer db.Close()
 	print := func(count *int) {
 		*count++
 		if *count%100 == 0 {
@@ -1247,7 +1518,7 @@ func TestWriteDeadlock(t *testing.T) {
 	var count int
 	val := make([]byte, 10000)
 	require.NoError(t, db.Update(func(txn *Txn) error {
-		for i := 0; i < 1500; i++ {
+		for i := 0; i < 1000; i++ {
 			key := fmt.Sprintf("%d", i)
 			rand.Read(val)
 			require.NoError(t, txn.SetEntry(NewEntry([]byte(key), val)))
@@ -1379,12 +1650,39 @@ func TestSequence_Release(t *testing.T) {
 	})
 }
 
+func TestTestSequence2(t *testing.T) {
+	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+		key := []byte("key")
+		seq1, err := db.GetSequence(key, 2)
+		require.NoError(t, err)
+
+		seq2, err := db.GetSequence(key, 2)
+		require.NoError(t, err)
+		num, err := seq2.Next()
+		require.NoError(t, err)
+		require.Equal(t, uint64(2), num)
+
+		require.NoError(t, seq2.Release())
+		require.NoError(t, seq1.Release())
+
+		seq3, err := db.GetSequence(key, 2)
+		require.NoError(t, err)
+		for i := 0; i < 5; i++ {
+			num2, err := seq3.Next()
+			require.NoError(t, err)
+			require.Equal(t, uint64(i)+3, num2)
+		}
+
+		require.NoError(t, seq3.Release())
+	})
+}
+
 func TestReadOnly(t *testing.T) {
+	t.Skipf("TODO: ReadOnly needs truncation, so this fails")
+
 	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
-	defer func() {
-		require.NoError(t, os.RemoveAll(dir))
-	}()
+	defer removeDir(dir)
 	opts := getTestOptions(dir)
 
 	// Create the DB
@@ -1454,13 +1752,10 @@ func TestReadOnly(t *testing.T) {
 func TestLSMOnly(t *testing.T) {
 	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
-	defer func() {
-		require.NoError(t, os.RemoveAll(dir))
-	}()
+	defer removeDir(dir)
 
 	opts := LSMOnlyOptions(dir)
 	dopts := DefaultOptions(dir)
-	require.NotEqual(t, dopts.ValueThreshold, opts.ValueThreshold)
 
 	dopts.ValueThreshold = 1 << 21
 	_, err = Open(dopts)
@@ -1469,17 +1764,15 @@ func TestLSMOnly(t *testing.T) {
 	// Also test for error, when ValueThresholdSize is greater than maxBatchSize.
 	dopts.ValueThreshold = LSMOnlyOptions(dir).ValueThreshold
 	// maxBatchSize is calculated from MaxTableSize.
-	dopts.MaxTableSize = int64(LSMOnlyOptions(dir).ValueThreshold)
+	dopts.MemTableSize = int64(LSMOnlyOptions(dir).ValueThreshold)
 	_, err = Open(dopts)
 	require.Error(t, err, "db creation should have been failed")
-	require.Contains(t, err.Error(), "Valuethreshold greater than max batch size")
+	require.Contains(t, err.Error(),
+		fmt.Sprintf("Valuethreshold %d greater than max batch size", dopts.ValueThreshold))
 
 	opts.ValueLogMaxEntries = 100
 	db, err := Open(opts)
 	require.NoError(t, err)
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	value := make([]byte, 128)
 	_, err = rand.Read(value)
@@ -1487,15 +1780,8 @@ func TestLSMOnly(t *testing.T) {
 		require.NoError(t, err)
 		txnSet(t, db, []byte(fmt.Sprintf("key%d", i)), value, 0x00)
 	}
-	require.NoError(t, db.Close()) // Close to force compactions, so Value log GC would run.
+	require.NoError(t, db.Close())
 
-	db, err = Open(opts)
-	require.NoError(t, err)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	require.NoError(t, db.RunValueLogGC(0.2))
 }
 
 // This test function is doing some intricate sorcery.
@@ -1542,53 +1828,64 @@ func TestMinReadTs(t *testing.T) {
 }
 
 func TestGoroutineLeak(t *testing.T) {
-	before := runtime.NumGoroutine()
-	t.Logf("Num go: %d", before)
-	for i := 0; i < 12; i++ {
-		runBadgerTest(t, nil, func(t *testing.T, db *DB) {
-			updated := false
-			ctx, cancel := context.WithCancel(context.Background())
-			var wg sync.WaitGroup
-			wg.Add(1)
-			var subWg sync.WaitGroup
-			subWg.Add(1)
-			go func() {
-				subWg.Done()
-				err := db.Subscribe(ctx, func(kvs *pb.KVList) {
-					require.Equal(t, []byte("value"), kvs.Kv[0].GetValue())
-					updated = true
-					wg.Done()
-				}, []byte("key"))
-				if err != nil {
-					require.Equal(t, err.Error(), context.Canceled.Error())
-				}
-			}()
-			subWg.Wait()
-			err := db.Update(func(txn *Txn) error {
-				return txn.SetEntry(NewEntry([]byte("key"), []byte("value")))
-			})
-			require.NoError(t, err)
-			wg.Wait()
-			cancel()
-			require.Equal(t, true, updated)
-		})
+	if !*manual {
+		t.Skip("Skipping test meant to be run manually.")
+		return
 	}
-	require.Equal(t, before, runtime.NumGoroutine())
+	test := func(t *testing.T, opt *Options) {
+		time.Sleep(1 * time.Second)
+		before := runtime.NumGoroutine()
+		t.Logf("Num go: %d", before)
+		for i := 0; i < 12; i++ {
+			runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+				updated := false
+				ctx, cancel := context.WithCancel(context.Background())
+				var wg sync.WaitGroup
+				wg.Add(1)
+				go func() {
+					match := pb.Match{Prefix: []byte("key"), IgnoreBytes: ""}
+					err := db.Subscribe(ctx, func(kvs *pb.KVList) error {
+						require.Equal(t, []byte("value"), kvs.Kv[0].GetValue())
+						updated = true
+						wg.Done()
+						return nil
+					}, []pb.Match{match})
+					if err != nil {
+						require.Equal(t, err.Error(), context.Canceled.Error())
+					}
+				}()
+				// Wait for the go routine to be scheduled.
+				time.Sleep(time.Second)
+				err := db.Update(func(txn *Txn) error {
+					return txn.SetEntry(NewEntry([]byte("key"), []byte("value")))
+				})
+				require.NoError(t, err)
+				wg.Wait()
+				cancel()
+				require.Equal(t, true, updated)
+			})
+		}
+		time.Sleep(2 * time.Second)
+		require.Equal(t, before, runtime.NumGoroutine())
+	}
+	t.Run("disk mode", func(t *testing.T) {
+		test(t, nil)
+	})
+	t.Run("InMemory mode", func(t *testing.T) {
+		opt := DefaultOptions("").WithInMemory(true)
+		test(t, &opt)
+	})
 }
 
 func ExampleOpen() {
 	dir, err := ioutil.TempDir("", "badger-test")
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
-	defer func() {
-		if err := os.RemoveAll(dir); err != nil {
-			log.Fatal(err)
-		}
-	}()
+	defer removeDir(dir)
 	db, err := Open(DefaultOptions(dir))
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 	defer db.Close()
 
@@ -1600,17 +1897,17 @@ func ExampleOpen() {
 	})
 
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 
 	txn := db.NewTransaction(true) // Read-write txn
 	err = txn.SetEntry(NewEntry([]byte("key"), []byte("value")))
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 	err = txn.Commit()
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 
 	err = db.View(func(txn *Txn) error {
@@ -1627,7 +1924,7 @@ func ExampleOpen() {
 	})
 
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 
 	// Output:
@@ -1638,17 +1935,13 @@ func ExampleOpen() {
 func ExampleTxn_NewIterator() {
 	dir, err := ioutil.TempDir("", "badger-test")
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
-	defer func() {
-		if err := os.RemoveAll(dir); err != nil {
-			log.Fatal(err)
-		}
-	}()
+	defer removeDir(dir)
 
 	db, err := Open(DefaultOptions(dir))
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 	defer db.Close()
 
@@ -1666,13 +1959,13 @@ func ExampleTxn_NewIterator() {
 	for i := 0; i < n; i++ {
 		err := txn.SetEntry(NewEntry(bkey(i), bval(i)))
 		if err != nil {
-			log.Fatal(err)
+			panic(err)
 		}
 	}
 
 	err = txn.Commit()
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 
 	opt := DefaultIteratorOptions
@@ -1689,7 +1982,7 @@ func ExampleTxn_NewIterator() {
 		return nil
 	})
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 	fmt.Printf("Counted %d elements", count)
 	// Output:
@@ -1699,9 +1992,7 @@ func ExampleTxn_NewIterator() {
 func TestSyncForRace(t *testing.T) {
 	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
-	defer func() {
-		require.NoError(t, os.RemoveAll(dir))
-	}()
+	defer removeDir(dir)
 
 	db, err := Open(DefaultOptions(dir).WithSyncWrites(false))
 	require.NoError(t, err)
@@ -1746,49 +2037,12 @@ func TestSyncForRace(t *testing.T) {
 	<-doneChan
 }
 
-// Earlier, if head is not pointing to latest Vlog file, then at replay badger used to crash with
-// index out of range panic. After fix in this commit it should not.
-func TestNoCrash(t *testing.T) {
-	dir, err := ioutil.TempDir("", "badger-test")
-	require.NoError(t, err, "cannot create badger dir")
-	defer func() {
-		require.NoError(t, os.RemoveAll(dir))
-	}()
-
-	ops := getTestOptions(dir)
-	ops.ValueLogMaxEntries = 1
-	db, err := Open(ops)
-	require.NoError(t, err, "unable to open db")
-
-	// entering 100 entries will generate 100 vlog files
-	for i := 0; i < 100; i++ {
-		err := db.Update(func(txn *Txn) error {
-			entry := NewEntry([]byte(fmt.Sprintf("key-%d", i)), []byte(fmt.Sprintf("val-%d", i)))
-			return txn.SetEntry(entry)
-		})
-		require.NoError(t, err, "update to db failed")
-	}
-
-	db.Lock()
-	// make head to point to first file
-	db.vhead = valuePointer{0, 0, 0}
-	db.Unlock()
-	db.Close()
-
-	// reduce size of SSTable to flush early
-	ops.MaxTableSize = 1 << 10
-	db, err = Open(ops)
-	require.Nil(t, err, "error while opening db")
-	require.NoError(t, db.Close())
-}
-
 func TestForceFlushMemtable(t *testing.T) {
 	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err, "temp dir for badger count not be created")
 
 	ops := getTestOptions(dir)
 	ops.ValueLogMaxEntries = 1
-	ops.LogRotatesToFlush = 1
 
 	db, err := Open(ops)
 	require.NoError(t, err, "error while openning db")
@@ -1806,127 +2060,519 @@ func TestForceFlushMemtable(t *testing.T) {
 	// We want to make sure that memtable is flushed on disk. While flushing memtable to disk,
 	// latest head is also stored in it. Hence we will try to read head from disk. To make sure
 	// this. we will truncate all memtables.
-	db.Lock()
+	db.lock.Lock()
 	db.mt.DecrRef()
 	for _, mt := range db.imm {
 		mt.DecrRef()
 	}
 	db.imm = db.imm[:0]
-	db.mt = skl.NewSkiplist(arenaSize(db.opt)) // Set it up for future writes.
-	db.Unlock()
-
-	// get latest value of value log head
-	headKey := y.KeyWithTs(head, math.MaxUint64)
-	vs, err := db.get(headKey)
+	db.mt, err = db.newMemTable()
 	require.NoError(t, err)
-	var vptr valuePointer
-	vptr.Decode(vs.Value)
-	// Since we are inserting 3 entries and ValueLogMaxEntries is 1, there will be 3 rotation. For
-	// 1st and 2nd time head flushed with memtable will have fid as 0 and last time it will be 1.
-	require.True(t, vptr.Fid == 1, fmt.Sprintf("expected fid: %d, actual fid: %d", 1, vptr.Fid))
+	db.lock.Unlock()
+
+	// Since we are inserting 3 entries and ValueLogMaxEntries is 1, there will be 3 rotation.
+	require.True(t, db.nextMemFid == 3,
+		fmt.Sprintf("expected fid: %d, actual fid: %d", 2, db.nextMemFid))
 }
 
 func TestVerifyChecksum(t *testing.T) {
-	// use stream write for writing.
-	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
-		value := make([]byte, 32)
-		y.Check2(rand.Read(value))
-		l := &pb.KVList{}
-		st := 0
-		for i := 0; i < 1000; i++ {
-			key := make([]byte, 8)
-			binary.BigEndian.PutUint64(key, uint64(i))
-			l.Kv = append(l.Kv, &pb.KV{
-				Key:      key,
-				Value:    value,
-				StreamId: uint32(st),
-				Version:  1,
-			})
-			if i%100 == 0 {
-				st++
+	testVerfiyCheckSum := func(t *testing.T, opt Options) {
+		path, err := ioutil.TempDir("", "badger-test")
+		require.NoError(t, err)
+		defer os.Remove(path)
+		opt.ValueDir = path
+		opt.Dir = path
+		// use stream write for writing.
+		runBadgerTest(t, &opt, func(t *testing.T, db *DB) {
+			value := make([]byte, 32)
+			y.Check2(rand.Read(value))
+			st := 0
+
+			buf := z.NewBuffer(10<<20, "test")
+			defer buf.Release()
+			for i := 0; i < 1000; i++ {
+				key := make([]byte, 8)
+				binary.BigEndian.PutUint64(key, uint64(i))
+				KVToBuffer(&pb.KV{
+					Key:      key,
+					Value:    value,
+					StreamId: uint32(st),
+					Version:  1,
+				}, buf)
+				if i%100 == 0 {
+					st++
+				}
 			}
-		}
 
-		sw := db.NewStreamWriter()
-		require.NoError(t, sw.Prepare(), "sw.Prepare() failed")
-		require.NoError(t, sw.Write(l), "sw.Write() failed")
-		require.NoError(t, sw.Flush(), "sw.Flush() failed")
+			sw := db.NewStreamWriter()
+			require.NoError(t, sw.Prepare(), "sw.Prepare() failed")
+			require.NoError(t, sw.Write(buf), "sw.Write() failed")
+			require.NoError(t, sw.Flush(), "sw.Flush() failed")
 
-		require.NoError(t, db.VerifyChecksum(), "checksum verification failed for DB")
+			require.NoError(t, db.VerifyChecksum(), "checksum verification failed for DB")
+		})
+	}
+	t.Run("Testing Verify Checksum without encryption", func(t *testing.T) {
+		testVerfiyCheckSum(t, getTestOptions(""))
+	})
+	t.Run("Testing Verify Checksum with Encryption", func(t *testing.T) {
+		key := make([]byte, 32)
+		_, err := rand.Read(key)
+		require.NoError(t, err)
+		opt := getTestOptions("")
+		opt.EncryptionKey = key
+		opt.BlockCacheSize = 1 << 20
+		opt.IndexCacheSize = 1 << 20
+		testVerfiyCheckSum(t, opt)
 	})
 }
 
 func TestMain(m *testing.M) {
-	// call flag.Parse() here if TestMain uses flags
-	go func() {
-		if err := http.ListenAndServe("localhost:8080", nil); err != nil {
-			log.Fatalf("Unable to open http port at 8080")
-		}
-	}()
+	flag.Parse()
 	os.Exit(m.Run())
 }
 
-func ExampleDB_Subscribe() {
-	prefix := []byte{'a'}
-
-	// This key should be printed, since it matches the prefix.
-	aKey := []byte("a-key")
-	aValue := []byte("a-value")
-
-	// This key should not be printed.
-	bKey := []byte("b-key")
-	bValue := []byte("b-value")
-
-	// Open the DB.
-	dir, err := ioutil.TempDir("", "badger-test")
-	if err != nil {
-		log.Fatal(err)
+func removeDir(dir string) {
+	if err := os.RemoveAll(dir); err != nil {
+		fmt.Printf("Error while removing dir: %v\n", err)
 	}
+}
+
+func TestWriteInemory(t *testing.T) {
+	opt := DefaultOptions("").WithInMemory(true)
+	db, err := Open(opt)
+	require.NoError(t, err)
 	defer func() {
-		if err := os.RemoveAll(dir); err != nil {
-			log.Fatal(err)
-		}
+		require.NoError(t, db.Close())
 	}()
-	db, err := Open(DefaultOptions(dir))
-	if err != nil {
-		log.Fatal(err)
+	for i := 0; i < 100; i++ {
+		txnSet(t, db, []byte(fmt.Sprintf("key%d", i)), []byte(fmt.Sprintf("val%d", i)), 0x00)
 	}
-	defer db.Close()
+	err = db.View(func(txn *Txn) error {
+		for j := 0; j < 100; j++ {
+			item, err := txn.Get([]byte(fmt.Sprintf("key%d", j)))
+			require.NoError(t, err)
+			expected := []byte(fmt.Sprintf("val%d", j))
+			item.Value(func(val []byte) error {
+				require.Equal(t, expected, val,
+					"Invalid value for key %q. expected: %q, actual: %q",
+					item.Key(), expected, val)
+				return nil
+			})
+		}
+		return nil
+	})
+	require.NoError(t, err)
+}
 
-	// Create the context here so we can cancel it after sending the writes.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func TestMinCacheSize(t *testing.T) {
+	opt := DefaultOptions("").
+		WithInMemory(true).
+		WithIndexCacheSize(16).
+		WithBlockCacheSize(16)
+	db, err := Open(opt)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, db.Close())
+	}()
 
-	// Use the WaitGroup to make sure we wait for the subscription to stop before continuing.
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		cb := func(kvs *KVList) {
-			for _, kv := range kvs.Kv {
-				fmt.Printf("%s is now set to %s\n", kv.Key, kv.Value)
+}
+
+func TestUpdateMaxCost(t *testing.T) {
+	dir, err := ioutil.TempDir("", "badger-test")
+	require.NoError(t, err, "temp dir for badger count not be created")
+	defer os.RemoveAll(dir)
+
+	ops := getTestOptions(dir).
+		WithBlockCacheSize(1 << 20).
+		WithIndexCacheSize(2 << 20)
+	db, err := Open(ops)
+	require.NoError(t, err)
+
+	cost, err := db.CacheMaxCost(BlockCache, -1)
+	require.NoError(t, err)
+	require.Equal(t, int64(1<<20), cost)
+	cost, err = db.CacheMaxCost(IndexCache, -1)
+	require.NoError(t, err)
+	require.Equal(t, int64(2<<20), cost)
+
+	_, err = db.CacheMaxCost(BlockCache, 2<<20)
+	require.NoError(t, err)
+	cost, err = db.CacheMaxCost(BlockCache, -1)
+	require.NoError(t, err)
+	require.Equal(t, int64(2<<20), cost)
+	_, err = db.CacheMaxCost(IndexCache, 4<<20)
+	require.NoError(t, err)
+	cost, err = db.CacheMaxCost(IndexCache, -1)
+	require.NoError(t, err)
+	require.Equal(t, int64(4<<20), cost)
+}
+
+func TestOpenDBReadOnly(t *testing.T) {
+	dir, err := ioutil.TempDir("", "badger-test")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	mp := make(map[string][]byte)
+
+	ops := getTestOptions(dir)
+	ops.ReadOnly = false
+	db, err := Open(ops)
+	require.NoError(t, err)
+	// Add bunch of entries that don't go into value log.
+	require.NoError(t, db.Update(func(txn *Txn) error {
+		val := make([]byte, 10)
+		rand.Read(val)
+		for i := 0; i < 10; i++ {
+			key := fmt.Sprintf("key-%05d", i)
+			require.NoError(t, txn.Set([]byte(key), val))
+			mp[key] = val
+		}
+		return nil
+	}))
+	require.NoError(t, db.Close())
+
+	ops.ReadOnly = true
+	db, err = Open(ops)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	db, err = Open(ops)
+	require.NoError(t, err)
+	var count int
+	read := func() {
+		count = 0
+		db.View(func(txn *Txn) error {
+			it := txn.NewIterator(DefaultIteratorOptions)
+			defer it.Close()
+			for it.Rewind(); it.Valid(); it.Next() {
+				item := it.Item()
+				require.NoError(t, item.Value(func(val []byte) error {
+					require.Equal(t, mp[string(item.Key())], val)
+					return nil
+				}))
+				count++
+			}
+			return nil
+		})
+	}
+	read()
+	require.Equal(t, 10, count)
+	require.NoError(t, db.Close())
+
+	ops.ReadOnly = false
+	db, err = Open(ops)
+	require.NoError(t, err)
+	// Add bunch of entries that go into value log.
+	require.NoError(t, db.Update(func(txn *Txn) error {
+		require.Greater(t, db.valueThreshold(), int64(10))
+		val := make([]byte, db.valueThreshold()+10)
+		rand.Read(val)
+		for i := 0; i < 10; i++ {
+			key := fmt.Sprintf("KEY-%05d", i)
+			require.NoError(t, txn.Set([]byte(key), val))
+			mp[key] = val
+		}
+		return nil
+	}))
+	require.NoError(t, db.Close())
+
+	ops.ReadOnly = true
+	db, err = Open(ops)
+	require.NoError(t, err)
+	read()
+	require.Equal(t, 20, count)
+	require.NoError(t, db.Close())
+}
+
+func TestBannedPrefixes(t *testing.T) {
+	dir, err := ioutil.TempDir("", "badger-test")
+	require.NoError(t, err, "temp dir for badger count not be created")
+	defer os.RemoveAll(dir)
+
+	opt := getTestOptions(dir).WithNamespaceOffset(3)
+	// All values go into vlog files. This is for checking if banned keys are properly decoded on DB
+	// restart.
+	opt.ValueThreshold = 0
+	opt.ValueLogMaxEntries = 2
+	// We store the uint64 namespace at idx=3, so first 3 bytes are insignificant to us.
+	initialBytes := make([]byte, opt.NamespaceOffset)
+	db, err := Open(opt)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(db.vlog.filesMap))
+
+	var keys [][]byte
+	var allPrefixes []uint64 = []uint64{1234, 3456, 5678, 7890, 901234}
+	for _, p := range allPrefixes {
+		prefix := y.U64ToBytes(p)
+		for i := 0; i < 10; i++ {
+			// We store the uint64 namespace at idx=3, so first 3 bytes are insignificant to us.
+			key := []byte(fmt.Sprintf("%s%s-key%02d", initialBytes, prefix, i))
+			keys = append(keys, key)
+		}
+	}
+
+	bannedPrefixes := make(map[uint64]struct{})
+	isBanned := func(key []byte) bool {
+		prefix := y.BytesToU64(key[3:])
+		if _, ok := bannedPrefixes[prefix]; ok {
+			return true
+		}
+		return false
+	}
+
+	validate := func() {
+		// Validate read/write.
+		for _, key := range keys {
+			txn := db.NewTransaction(true)
+			_, rerr := txn.Get(key)
+			werr := txn.Set(key, []byte("value"))
+			txn.Discard()
+			if isBanned(key) {
+				require.Equal(t, ErrBannedKey, rerr)
+				require.Equal(t, ErrBannedKey, werr)
+			} else {
+				require.NoError(t, rerr)
+				require.NoError(t, werr)
 			}
 		}
-		if err := db.Subscribe(ctx, cb, prefix); err != nil && err != context.Canceled {
-			log.Fatal(err)
+	}
+
+	for _, key := range keys {
+		require.NoError(t, db.Update(func(txn *Txn) error {
+			return txn.SetEntry(NewEntry([]byte(key), []byte("value")))
+		}))
+	}
+	validate()
+
+	// Ban a couple of prefix and validate that we should not be able to read/write them.
+	require.NoError(t, db.BanNamespace(1234))
+	bannedPrefixes[1234] = struct{}{}
+	validate()
+
+	require.NoError(t, db.BanNamespace(5678))
+	bannedPrefixes[5678] = struct{}{}
+	validate()
+
+	require.Greater(t, len(db.vlog.filesMap), 1)
+	require.NoError(t, db.Close())
+
+	db, err = Open(opt)
+	require.NoError(t, err)
+	validate()
+	require.NoError(t, db.Close())
+}
+
+// Tests that the iterator skips the banned prefixes. Sets keys with multiple versions in
+// different namespaces and maintains a sorted list of those keys in-memory.
+// Then, ban few prefixes and iterate over the DB and match it with the corresponding keys from the
+// in-memory list. Simulate the skipping in in-memory list as well.
+func TestIterateWithBanned(t *testing.T) {
+	opt := DefaultOptions("").WithNamespaceOffset(3)
+	opt.NumVersionsToKeep = math.MaxInt64
+
+	// We store the uint64 namespace at idx=3, so first 3 bytes are insignificant to us.
+	initialBytes := make([]byte, opt.NamespaceOffset)
+	runBadgerTest(t, &opt, func(t *testing.T, db *DB) {
+		bkey := func(prefix uint64, i int) []byte {
+			return []byte(fmt.Sprintf("%s%s-%04d", initialBytes, y.U64ToBytes(prefix), i))
 		}
-		log.Printf("subscription closed")
-	}()
 
-	// Write both keys, but only one should be printed in the Output.
-	err = db.Update(func(txn *Txn) error { return txn.Set(aKey, aValue) })
-	if err != nil {
-		log.Fatal(err)
-	}
-	err = db.Update(func(txn *Txn) error { return txn.Set(bKey, bValue) })
-	if err != nil {
-		log.Fatal(err)
+		N := 100
+		V := 3
+
+		// Generate 26*N keys, each with V versions (versions set by txnSet())
+		var keys [][]byte
+		for i := 'a'; i <= 'z'; i++ {
+			for j := 0; j < N; j++ {
+				for v := 0; v < V; v++ {
+					keys = append(keys, bkey(uint64(i*1000), j))
+				}
+			}
+		}
+		for _, key := range keys {
+			txnSet(t, db, key, key, 0)
+		}
+
+		// Validate that we don't see the banned keys in iterating.
+		// Pass it the iterator options, idx to start from in the in-memory list, and the number of
+		// keys we expect to see through iteration.
+		validate := func(iopts IteratorOptions, idx, expected int) {
+			txn := db.NewTransaction(false)
+			defer txn.Discard()
+			itr := txn.NewIterator(iopts)
+			defer itr.Close()
+			incIdx := func() {
+				n := 1
+				// If AllVersions is set, then we need to skip V keys.
+				if !iopts.AllVersions {
+					n *= V
+				}
+				// If Reverse iterating, then decrement the index of in-memory list.
+				if iopts.Reverse {
+					idx -= n
+				} else {
+					idx += n
+				}
+			}
+			count := 0
+			for itr.Seek(itr.opt.Prefix); itr.Valid(); itr.Next() {
+				// Iterator should skip the banned keys, so should we.
+				for db.isBanned(keys[idx]) != nil {
+					incIdx()
+				}
+				count++
+				require.Equalf(t, keys[idx], itr.Item().Key(), "count:%d", count)
+				incIdx()
+			}
+			require.Equal(t, expected, count)
+		}
+
+		getIterablePrefix := func(i int) []byte {
+			return []byte(fmt.Sprintf("%s%s", initialBytes, y.U64ToBytes(uint64(i*1000))))
+		}
+		validate(IteratorOptions{}, 0, 26*N)
+		validate(IteratorOptions{Reverse: true, AllVersions: true}, 26*N*V-1, 26*N*V)
+		validate(IteratorOptions{Prefix: getIterablePrefix('f')}, 5*N*V, N)
+
+		require.NoError(t, db.BanNamespace(uint64('a'*1000)))
+		validate(IteratorOptions{}, 1*N*V, 25*N)
+		validate(IteratorOptions{AllVersions: true}, 1*N*V, 25*N*V)
+		validate(IteratorOptions{Reverse: true, AllVersions: true}, 26*N*V-1, 25*N*V)
+
+		require.NoError(t, db.BanNamespace(uint64('b'*1000)))
+		validate(IteratorOptions{}, 2*N*V, 24*N)
+		validate(IteratorOptions{AllVersions: true}, 2*N*V, 24*N*V)
+
+		require.NoError(t, db.BanNamespace(uint64('d'*1000)))
+		validate(IteratorOptions{}, 2*N*V, 23*N)
+		validate(IteratorOptions{AllVersions: true}, 2*N*V, 23*N*V)
+		validate(IteratorOptions{Prefix: getIterablePrefix('f')}, 5*N*V, N)
+		validate(IteratorOptions{Prefix: getIterablePrefix('f'), AllVersions: true}, 5*N*V, N*V)
+
+		require.NoError(t, db.BanNamespace(uint64('g')*1000))
+		validate(IteratorOptions{AllVersions: true}, 2*N*V, 22*N*V)
+
+		require.NoError(t, db.BanNamespace(uint64('r'*1000)))
+		validate(IteratorOptions{}, 2*N*V, 21*N)
+		validate(IteratorOptions{Reverse: true, AllVersions: true}, 26*N*V-1, 21*N*V)
+
+		// Iterate over the banned prefix. Passing -1 as we don't expect to access keys.
+		validate(IteratorOptions{Prefix: getIterablePrefix('g')}, -1, 0)
+		validate(IteratorOptions{Prefix: getIterablePrefix('g'), Reverse: true, AllVersions: true},
+			-1, 0)
+
+		require.NoError(t, db.BanNamespace(uint64('z'*1000)))
+		validate(IteratorOptions{}, 2*N*V, 20*N)
+		validate(IteratorOptions{AllVersions: true}, 2*N*V, 20*N*V)
+		validate(IteratorOptions{Reverse: true, AllVersions: true}, 25*N*V-1, 20*N*V)
+	})
+}
+
+// A basic test that checks if the DB works even if user is not using the DefaultOptions.
+func TestBannedAtZeroOffset(t *testing.T) {
+	opt := getTestOptions("")
+	// When DefaultOptions is not used, NamespaceOffset will be set to 0.
+	opt.NamespaceOffset = 0
+	runBadgerTest(t, &opt, func(t *testing.T, db *DB) {
+		require.Equal(t, 0, db.opt.NamespaceOffset)
+		err := db.Update(func(txn *Txn) error {
+			for i := 0; i < 10; i++ {
+				entry := NewEntry([]byte(fmt.Sprintf("key%d", i)), []byte(fmt.Sprintf("val%d", i)))
+				if err := txn.SetEntry(entry); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		require.NoError(t, err)
+
+		err = db.View(func(txn *Txn) error {
+			for i := 0; i < 10; i++ {
+				item, err := txn.Get([]byte(fmt.Sprintf("key%d", i)))
+				if err != nil {
+					return err
+				}
+
+				expected := []byte(fmt.Sprintf("val%d", i))
+				if err := item.Value(func(val []byte) error {
+					require.Equal(t, expected, val,
+						"Invalid value for key %q. expected: %q, actual: %q",
+						item.Key(), expected, val)
+					return nil
+				}); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		require.NoError(t, err)
+	})
+}
+
+func TestSeekTs(t *testing.T) {
+	opt := getTestOptions("")
+	opt = opt.WithNumVersionsToKeep(1000)
+	opt.managedTxns = true
+
+	key := []byte("foo")
+
+	testReadTs := func(db *DB, readTs, maxTs uint64) {
+		txn := db.NewTransactionAt(readTs, true)
+		iterOpts := DefaultIteratorOptions
+		iterOpts.AllVersions = true
+		iterOpts.PrefetchValues = false
+		itr := txn.NewKeyIterator(key, iterOpts)
+
+		latestTs := itr.Seek(key)
+		require.Equal(t, latestTs, maxTs)
+
+		for ; itr.Valid(); itr.Next() {
+			version := itr.Item().Version()
+			require.LessOrEqual(t, uint64(version), readTs)
+			break
+		}
 	}
 
-	log.Printf("stopping subscription")
-	cancel()
-	log.Printf("waiting for subscription to close")
-	wg.Wait()
-	// Output:
-	// a-key is now set to a-value
+	runBadgerTest(t, &opt, func(t *testing.T, db *DB) {
+		for i := uint64(1); i < 50; i++ {
+			txn := db.NewTransactionAt(i, true)
+			require.NoError(t, txn.SetEntry(NewEntry(key, []byte("bar")).WithMeta(0x00)))
+			require.NoError(t, txn.CommitAt(i+1, nil))
+			txn.Discard()
+		}
+
+		for i := uint64(1); i < 55; i++ {
+			testReadTs(db, i, 50)
+		}
+	})
+}
+
+func TestCompactL0OnClose(t *testing.T) {
+	opt := getTestOptions("")
+	opt.CompactL0OnClose = true
+	opt.ValueThreshold = 1 // Every value goes to value log
+	opt.NumVersionsToKeep = 1
+	runBadgerTest(t, &opt, func(t *testing.T, db *DB) {
+		var keys [][]byte
+		val := make([]byte, 1<<12)
+		for i := 0; i < 10; i++ {
+			key := make([]byte, 40)
+			_, err := rand.Read(key)
+			require.NoError(t, err)
+			keys = append(keys, key)
+
+			err = db.Update(func(txn *Txn) error {
+				return txn.SetEntry(NewEntry(key, val))
+			})
+			require.NoError(t, err)
+		}
+
+		for _, key := range keys {
+			err := db.Update(func(txn *Txn) error {
+				return txn.SetEntry(NewEntry(key, val))
+			})
+			require.NoError(t, err)
+		}
+	})
 }

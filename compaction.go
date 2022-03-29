@@ -23,16 +23,19 @@ import (
 	"math"
 	"sync"
 
-	"golang.org/x/net/trace"
-
-	"github.com/dgraph-io/badger/table"
-	"github.com/dgraph-io/badger/y"
+	"github.com/dgraph-io/badger/v3/table"
+	"github.com/dgraph-io/badger/v3/y"
 )
 
 type keyRange struct {
 	left  []byte
 	right []byte
 	inf   bool
+	size  int64 // size is used for Key splits.
+}
+
+func (r keyRange) isEmpty() bool {
+	return len(r.left) == 0 && len(r.right) == 0 && !r.inf
 }
 
 var infRange = keyRange{inf: true}
@@ -47,15 +50,45 @@ func (r keyRange) equals(dst keyRange) bool {
 		r.inf == dst.inf
 }
 
+func (r *keyRange) extend(kr keyRange) {
+	// TODO(ibrahim): Is this needed?
+	if kr.isEmpty() {
+		return
+	}
+	if r.isEmpty() {
+		*r = kr
+	}
+	if len(r.left) == 0 || y.CompareKeys(kr.left, r.left) < 0 {
+		r.left = kr.left
+	}
+	if len(r.right) == 0 || y.CompareKeys(kr.right, r.right) > 0 {
+		r.right = kr.right
+	}
+	if kr.inf {
+		r.inf = true
+	}
+}
+
 func (r keyRange) overlapsWith(dst keyRange) bool {
+	// Empty keyRange always overlaps.
+	if r.isEmpty() {
+		return true
+	}
+	// TODO(ibrahim): Do you need this?
+	// Empty dst doesn't overlap with anything.
+	if dst.isEmpty() {
+		return false
+	}
 	if r.inf || dst.inf {
 		return true
 	}
 
+	// [dst.left, dst.right] ... [r.left, r.right]
 	// If my left is greater than dst right, we have no overlap.
 	if y.CompareKeys(r.left, dst.right) > 0 {
 		return false
 	}
+	// [r.left, r.right] ... [dst.left, dst.right]
 	// If my right is less than dst left, we have no overlap.
 	if y.CompareKeys(r.right, dst.left) < 0 {
 		return false
@@ -64,6 +97,9 @@ func (r keyRange) overlapsWith(dst keyRange) bool {
 	return true
 }
 
+// getKeyRange returns the smallest and the biggest in the list of tables.
+// TODO(naman): Write a test for this. The smallest and the biggest should
+// be the smallest of the leftmost table and the biggest of the right most table.
 func getKeyRange(tables ...*table.Table) keyRange {
 	if len(tables) == 0 {
 		return keyRange{}
@@ -126,19 +162,7 @@ func (lcs *levelCompactStatus) remove(dst keyRange) bool {
 type compactStatus struct {
 	sync.RWMutex
 	levels []*levelCompactStatus
-}
-
-func (cs *compactStatus) toLog(tr trace.Trace) {
-	cs.RLock()
-	defer cs.RUnlock()
-
-	tr.LazyPrintf("Compaction status:")
-	for i, l := range cs.levels {
-		if l.debug() == "" {
-			continue
-		}
-		tr.LazyPrintf("[%d] %s", i, l.debug())
-	}
+	tables map[uint64]struct{}
 }
 
 func (cs *compactStatus) overlapsWith(level int, this keyRange) bool {
@@ -163,11 +187,10 @@ func (cs *compactStatus) compareAndAdd(_ thisAndNextLevelRLocked, cd compactDef)
 	cs.Lock()
 	defer cs.Unlock()
 
-	level := cd.thisLevel.level
-
-	y.AssertTruef(level < len(cs.levels)-1, "Got level %d. Max levels: %d", level, len(cs.levels))
-	thisLevel := cs.levels[level]
-	nextLevel := cs.levels[level+1]
+	tl := cd.thisLevel.level
+	y.AssertTruef(tl < len(cs.levels), "Got level %d. Max levels: %d", tl, len(cs.levels))
+	thisLevel := cs.levels[cd.thisLevel.level]
+	nextLevel := cs.levels[cd.nextLevel.level]
 
 	if thisLevel.overlapsWith(cd.thisRange) {
 		return false
@@ -183,6 +206,9 @@ func (cs *compactStatus) compareAndAdd(_ thisAndNextLevelRLocked, cd compactDef)
 	thisLevel.ranges = append(thisLevel.ranges, cd.thisRange)
 	nextLevel.ranges = append(nextLevel.ranges, cd.nextRange)
 	thisLevel.delSize += cd.thisSize
+	for _, t := range append(cd.top, cd.bot...) {
+		cs.tables[t.ID()] = struct{}{}
+	}
 	return true
 }
 
@@ -190,24 +216,34 @@ func (cs *compactStatus) delete(cd compactDef) {
 	cs.Lock()
 	defer cs.Unlock()
 
-	level := cd.thisLevel.level
-	y.AssertTruef(level < len(cs.levels)-1, "Got level %d. Max levels: %d", level, len(cs.levels))
+	tl := cd.thisLevel.level
+	y.AssertTruef(tl < len(cs.levels), "Got level %d. Max levels: %d", tl, len(cs.levels))
 
-	thisLevel := cs.levels[level]
-	nextLevel := cs.levels[level+1]
+	thisLevel := cs.levels[cd.thisLevel.level]
+	nextLevel := cs.levels[cd.nextLevel.level]
 
 	thisLevel.delSize -= cd.thisSize
 	found := thisLevel.remove(cd.thisRange)
-	found = nextLevel.remove(cd.nextRange) && found
+	// The following check makes sense only if we're compacting more than one
+	// table. In case of the max level, we might rewrite a single table to
+	// remove stale data.
+	if cd.thisLevel != cd.nextLevel && !cd.nextRange.isEmpty() {
+		found = nextLevel.remove(cd.nextRange) && found
+	}
 
 	if !found {
 		this := cd.thisRange
 		next := cd.nextRange
-		fmt.Printf("Looking for: [%q, %q, %v] in this level.\n", this.left, this.right, this.inf)
+		fmt.Printf("Looking for: %s in this level %d.\n", this, tl)
 		fmt.Printf("This Level:\n%s\n", thisLevel.debug())
 		fmt.Println()
-		fmt.Printf("Looking for: [%q, %q, %v] in next level.\n", next.left, next.right, next.inf)
+		fmt.Printf("Looking for: %s in next level %d.\n", next, cd.nextLevel.level)
 		fmt.Printf("Next Level:\n%s\n", nextLevel.debug())
 		log.Fatal("keyRange not found")
+	}
+	for _, t := range append(cd.top, cd.bot...) {
+		_, ok := cs.tables[t.ID()]
+		y.AssertTrue(ok)
+		delete(cs.tables, t.ID())
 	}
 }
